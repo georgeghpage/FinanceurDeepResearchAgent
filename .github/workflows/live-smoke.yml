@@ -1,0 +1,36 @@
+name: Manually enabled live smoke
+on:
+  workflow_dispatch:
+    inputs:
+      enable_live:
+        description: 'Authorize at most three small provider requests'
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  smoke:
+    if: inputs.enable_live
+    environment: live-qa
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      JUDGE_MODEL_TOKEN: ${{ secrets.JUDGE_MODEL_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          python-version: '3.11'
+      - run: uv sync --frozen --group dev
+      - run: uv run --frozen python scripts/run_tests.py --suite smoke --live --output reports/qa/live
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: live-smoke
+          path: reports/qa/live
+          if-no-files-found: error

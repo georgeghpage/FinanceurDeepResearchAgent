@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "label_origin": "deterministic_contract_expectation_not_human_labels",
+  "cases": [
+    {
+      "id": "complete",
+      "mutations": {},
+      "expected_eligible": true
+    },
+    {
+      "id": "critical-missing",
+      "mutations": {
+        "requirement_status": "MISSING"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "critical-partial",
+      "mutations": {
+        "requirement_status": "PARTIAL"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "critical-conflicted",
+      "mutations": {
+        "requirement_status": "CONFLICTED"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "evidence_status-unverified",
+      "mutations": {
+        "evidence_status": "UNVERIFIED"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "evidence_status-contradicted",
+      "mutations": {
+        "evidence_status": "CONTRADICTED"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "evidence_status-partially_supported",
+      "mutations": {
+        "evidence_status": "PARTIALLY_SUPPORTED"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "excerpt-",
+      "mutations": {
+        "excerpt": ""
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "source_id-forged",
+      "mutations": {
+        "source_id": "FORGED"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "coverage_score-0.89",
+      "mutations": {
+        "coverage_score": 0.89
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "criticality-false",
+      "mutations": {
+        "criticality": false
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "critical_gap-missing-geographic-constraint",
+      "mutations": {
+        "critical_gap": "Missing geographic constraint"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "contradiction-records-disagree",
+      "mutations": {
+        "contradiction": "Records disagree"
+      },
+      "expected_eligible": false
+    },
+    {
+      "id": "supporting_claim-forged",
+      "mutations": {
+        "supporting_claim": "FORGED"
+      },
+      "expected_eligible": false
+    }
+  ]
+}

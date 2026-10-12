@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Ask a question, follow the research, and read a source-backed answer.">
+  <title>Deep Research</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/dashboard.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="history-sidebar" aria-label="Previous chats">
+    <div class="history-heading"><h2>Your chats</h2><button id="new-chat" class="secondary" type="button">New chat +</button></div>
+    <p id="history-status" class="history-status" role="status">Loading chats…</p>
+    <nav id="chat-list" aria-label="Chat history"></nav>
+    <button id="load-more" class="secondary" type="button" hidden>Load older chats</button>
+  </aside>
+  <main>
+    <header>
+      <div class="brand"><span class="brand-icon" aria-hidden="true">✳</span> Deep Research</div>
+      <span class="local">Local workspace</span>
+    </header>
+    <section id="intro" class="intro">
+      <p class="eyebrow">A little curiosity goes a long way</p>
+      <h1>What would you like to know?</h1>
+      <p>Ask a question. Follow the research. Get an answer with sources.</p>
+    </section>
+    <section id="sent-message" class="sent-message" hidden aria-label="Your message">
+      <p class="message-author">You</p><p id="sent-question" class="message-bubble"></p>
+    </section>
+    <div id="typing" class="typing" hidden role="status" aria-label="Agent is thinking"><span></span><span></span><span></span></div>
+    <form id="research-form">
+      <p id="provider-status" class="provider-status" role="status">DeepSeek V4.1 Flash · Aliyun Model Studio</p>
+      <label for="question">Your research question</label>
+      <textarea id="question" name="question" rows="1" maxlength="8000" required placeholder="e.g. What drove Apple's revenue growth in FY2025?"></textarea>
+      <div class="form-footer"><span>Enter to research · Shift+Enter for a new line</span><div class="form-actions"><button id="stop" class="stop" type="button" hidden>Stop research ■</button><button id="submit" type="submit">Start research <span aria-hidden="true">↗</span></button></div></div>
+    </form>
+    <section id="activity" class="activity" hidden aria-labelledby="activity-title">
+      <div class="activity-top"><div class="status-label"><span id="status-icon" class="status-icon" aria-hidden="true"></span><h2 id="activity-title">Thinking…</h2></div><span id="source-count"></span><span id="elapsed">0s</span></div>
+      <p id="status" role="status" aria-live="polite">Starting research</p>
+      <details id="activity-history" class="activity-history"><summary>Activity history <span id="activity-count"></span></summary>
+      <div class="trace-top"><h3>Research activity</h3><button id="download-trace" class="secondary" type="button">Save trace ↓</button></div>
+      <div id="trace" class="trace" role="region" aria-label="Research activity history" tabindex="0"><ol id="events"></ol></div></details>
+    </section>
+    <p id="error" class="error" role="alert" hidden></p>
+    <section id="answer-section" class="answer-section" hidden aria-labelledby="answer-title">
+      <div class="answer-top"><div><p class="eyebrow">The findings</p><h2 id="answer-title">Your answer</h2></div><button id="download" class="secondary" type="button">Save report ↓</button></div>
+      <article id="answer"></article>
+    </section>
+    <footer>Thoughtful research. Sources you can follow.</footer>
+  </main>
+  <details id="diagnostics" class="diagnostics"><summary>Developer diagnostics</summary>
+  <aside id="dashboard" class="dashboard" aria-label="Research tracing dashboard">
+    <div class="dashboard-heading"><div><p class="eyebrow">Observability</p><h2>Run overview</h2></div><span id="dashboard-state" class="run-badge">Idle</span></div>
+    <p id="dashboard-run" class="dashboard-caption">Start a research chat to see live measurements.</p>
+    <div class="dashboard-stats">
+      <div><span>Observed tokens</span><strong id="dashboard-tokens">0</strong><small id="dashboard-token-note">Waiting for usage</small></div>
+      <div><span>Estimated cost · USD</span><strong id="dashboard-cost">—</strong><small id="dashboard-cost-note">Waiting for calls</small></div>
+      <div><span>Run duration</span><strong id="dashboard-duration">0.0s</strong><small>Wall-clock time</small></div>
+      <div><span>Calls / errors</span><strong id="dashboard-calls">0 / 0</strong><small id="dashboard-call-note">0 model · 0 tool</small></div>
+    </div>
+    <div class="token-breakdown"><span>Input <b id="dashboard-input">—</b></span><span>Output <b id="dashboard-output">—</b></span><span>Cache hit <b id="dashboard-cache">—</b></span></div>
+    <div class="dashboard-section-heading"><h3>Call waterfall</h3><label class="sr-only" for="dashboard-filter">Filter calls</label><select id="dashboard-filter"><option value="all">All calls</option><option value="model">Model calls</option><option value="tool">Tool calls</option><option value="error">Errors</option></select></div>
+    <div class="waterfall-axis"><span>0s</span><span id="dashboard-axis-end">0s</span></div>
+    <p id="dashboard-empty" class="dashboard-empty">Every model request and search tool call will appear here.</p>
+    <div class="calls-table-wrap"><table class="calls-table"><thead><tr><th scope="col">Operation / status</th><th scope="col">Timeline</th><th scope="col">Time</th><th scope="col">Tokens</th><th scope="col">Est. USD</th></tr></thead><tbody id="dashboard-rows"></tbody></table></div>
+    <section id="dashboard-detail" class="dashboard-detail" hidden aria-labelledby="dashboard-detail-title"><h3 id="dashboard-detail-title">Call detail</h3><p id="dashboard-detail-description"></p><dl id="dashboard-detail-values"></dl></section>
+    <details class="pricing-details"><summary>Pricing & measurement</summary><p id="dashboard-pricing">Rates are saved with each run. Token counts come from the provider, when reported.</p><p>USD reference estimates may differ from your account bill. Missing cache data is priced as uncached input. Reasoning is included in output, never added twice. Search estimates use the advanced-search reference rate; failed search billing is unknown.</p><p><a href="https://platform.kimi.ai/docs/pricing/chat" target="_blank" rel="noopener noreferrer">Kimi pricing ↗</a> · <a href="https://www.alibabacloud.com/help/en/model-studio/model-pricing" target="_blank" rel="noopener noreferrer">AliYun pricing ↗</a> · <a href="https://docs.tavily.com/documentation/api-credits" target="_blank" rel="noopener noreferrer">Tavily pricing ↗</a></p></details>
+  </aside></details>
+</body>
+</html>

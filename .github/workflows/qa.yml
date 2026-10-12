@@ -1,0 +1,165 @@
+name: Deterministic QA
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: '0 18 * * *' # 02:00 Asia/Shanghai
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: qa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: '3.11'
+      - run: uv sync --frozen --group dev
+      - run: uv run --frozen python scripts/qa_checks.py
+      - run: uv run --frozen python scripts/run_tests.py --suite unit --output reports/qa/fast/unit
+      - run: uv run --frozen python scripts/run_tests.py --suite agent --output reports/qa/fast/agent
+      - run: uv run --frozen python scripts/run_tests.py --suite security --output reports/qa/fast/security
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fast-checks
+          path: reports/qa/fast
+          if-no-files-found: error
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: qa-local-only
+          POSTGRES_USER: qa
+          POSTGRES_DB: qa
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://qa:qa-local-only@127.0.0.1:5432/qa
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: uv sync --frozen --group dev
+      - run: npm ci --ignore-scripts
+      - run: uv run --frozen python scripts/run_tests.py --suite all --coverage --require-database
+      - run: uv run --frozen python scripts/qa_evaluate.py
+        if: always()
+      - name: Enforce requested release coverage
+        if: always()
+        run: |
+          uv run --frozen python -c "import json; r=json.load(open('reports/qa/results.json')); raise SystemExit(0 if r['coverage']['gates_passed'] else 1)"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qa-backend
+          path: reports/qa
+          if-no-files-found: error
+  browser:
+    # Reviewed darwin screenshots; Linux must obtain separately reviewed baselines.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: uv sync --frozen --group dev
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium firefox webkit
+      - run: npm test
+      - run: npm run test:browser:matrix
+      - run: npm run test:visual
+        if: always()
+        env:
+          QA_BROWSER_REPORT_DIR: reports/qa/visual
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qa-browser
+          path: reports/qa
+          if-no-files-found: error
+  load-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: uv sync --frozen --group dev
+      - run: npm ci --ignore-scripts
+      - name: Bounded fake load matrix
+        run: |
+          for c in 1 5 10 25 50; do
+            uv run --frozen python scripts/qa_load.py --sessions 100 --concurrency "$c" --output "reports/qa/load/c$c.json"
+          done
+      - name: Bounded soak
+        run: uv run --frozen python scripts/qa_load.py --sessions 500 --concurrency 10 --seconds 60 --output reports/qa/load/soak.json
+      - name: Nightly extended soak
+        if: github.event_name == 'schedule'
+        run: uv run --frozen python scripts/qa_load.py --sessions 3000 --concurrency 25 --seconds 300 --output reports/qa/load/nightly.json
+      - run: uv run --frozen pip-audit --skip-editable --format json --output reports/qa/python-audit.json --progress-spinner off
+        if: always()
+      - run: npm audit --json > reports/qa/npm-audit.json
+        if: always()
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qa-load-security
+          path: reports/qa
+          if-no-files-found: error
+  report:
+    if: always()
+    needs: [fast, backend, browser, load-security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: qa-*
+          path: reports/qa
+          merge-multiple: true
+      - run: python3 scripts/qa_report.py --require-all
+      - name: Publish job summary
+        if: always()
+        run: cat reports/qa/consolidated/QUALITY_REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: consolidated-report
+          path: reports/qa/consolidated
+          if-no-files-found: error

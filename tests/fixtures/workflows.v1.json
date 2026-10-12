@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "origin": "scripted_regression_not_real_model_accuracy",
+  "cases": [
+    {
+      "id": "complete",
+      "question": "Establish facts 1, 2 and 3 in 2026",
+      "decisions": [
+        "READY"
+      ],
+      "expected_stop": "coverage",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "42",
+        "2026",
+        "Sources"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    },
+    {
+      "id": "refinement",
+      "question": "Establish facts after targeted follow-up",
+      "decisions": [
+        "RESEARCH_MORE",
+        "READY"
+      ],
+      "expected_stop": "coverage",
+      "expected_searches": 16,
+      "expected_findings": 4,
+      "required_terms": [
+        "42",
+        "Sources"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    },
+    {
+      "id": "insufficient",
+      "question": "Establish unavailable fact",
+      "decisions": [
+        "INSUFFICIENT_EVIDENCE"
+      ],
+      "expected_stop": "no_tasks",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "Unresolved requirement R3",
+        "Limitations"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    },
+    {
+      "id": "empty",
+      "question": "Establish missing public fact",
+      "decisions": [
+        "READY"
+      ],
+      "empty_search": true,
+      "expected_stop": "no_tasks",
+      "expected_searches": 15,
+      "expected_findings": 0,
+      "required_terms": [
+        "No eligible source-backed evidence",
+        "Limitations"
+      ],
+      "forbidden_terms": [
+        "measured value of 42"
+      ]
+    },
+    {
+      "id": "invented_excerpt",
+      "question": "Adversarial missing evidence",
+      "decisions": [
+        "READY"
+      ],
+      "backend": {
+        "wrong_excerpt": true
+      },
+      "expected_stop": "no_tasks",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "Limitations"
+      ],
+      "forbidden_terms": [
+        "measured value of 42"
+      ]
+    },
+    {
+      "id": "unsupported_report",
+      "question": "Establish supported facts",
+      "decisions": [
+        "READY"
+      ],
+      "backend": {
+        "unsupported_report": true
+      },
+      "expected_stop": "coverage",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "42",
+        "Sources"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    },
+    {
+      "id": "semantic_rejection",
+      "question": "Reject unsupported semantic additions",
+      "decisions": [
+        "READY"
+      ],
+      "backend": {
+        "audit_reject": true
+      },
+      "expected_stop": "coverage",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "42",
+        "Sources"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    },
+    {
+      "id": "classifier_outage",
+      "question": "Best effort after classifier outage",
+      "decisions": [
+        "READY"
+      ],
+      "judge_errors": 2,
+      "expected_stop": "no_tasks",
+      "expected_searches": 15,
+      "expected_findings": 3,
+      "required_terms": [
+        "classification was unavailable",
+        "42"
+      ],
+      "forbidden_terms": [
+        "F999"
+      ]
+    }
+  ]
+}
