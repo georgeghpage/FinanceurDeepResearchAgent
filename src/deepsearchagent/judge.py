@@ -11,8 +11,9 @@ from openai import OpenAI
 from .budget import stage_prompt, token_bound
 from .config import environment_values, require_api_key
 from .capabilities import inference_options, model_limits
+from .diagnostics import safe_request_id
 from .llm import BudgetExceeded, ResponseError
-from .models import JudgeDecision
+from .models import JudgeDecision, QualityEvaluation
 
 
 class EvidenceJudge(Protocol):
@@ -20,6 +21,8 @@ class EvidenceJudge(Protocol):
     model: str
 
     def evaluate(self, question, requirements, evidence, research_state) -> JudgeDecision: ...
+
+    def evaluate_answer(self, question, requirements, answer, evidence, research_state) -> QualityEvaluation: ...
 
 
 def validate_decision(decision, requirements, findings, sources):
@@ -94,9 +97,6 @@ def evidence_snapshot(state, max_bytes):
                 continue
             finding = fs[index]
             data = finding.model_dump()
-            data["claim"] = finding.claim[:700]
-            data["evidence"] = finding.evidence[:600]
-            data["limitations"] = finding.limitations[:3]
             source = sources[finding.source_id]
             candidate_sources = {**selected_sources, source.id: {"id": source.id, "url": source.url,
                 "title": source.title[:200], "published_at": source.published_at, "retrieved_at": source.retrieved_at}}
@@ -114,8 +114,8 @@ class OpenAICompatibleJudge:
         self.config = config
         self.provider = config.judge_fallback_provider if fallback else config.judge_provider
         self.model = config.judge_fallback_model if fallback else config.judge_model
-        fallback_url = config.kimi_base_url if self.provider == "kimi" else config.judge_base_url if self.provider == "pai" else config.aliyun_base_url
-        self.base_url = (config.judge_fallback_base_url or fallback_url) if fallback else config.judge_base_url
+        fallback_url = config.kimi_base_url if self.provider == "kimi" else (config.judge_base_url or "https://aiservice.cn-hangzhou.aliyuncs.com/v1") if self.provider == "pai" else config.aliyun_base_url
+        self.base_url = (config.judge_fallback_base_url or fallback_url) if fallback else (config.judge_base_url or fallback_url)
         env = environment_values()
         token = env.get("JUDGE_MODEL_TOKEN", "").strip() if self.provider == "pai" else require_api_key(self.provider)
         if not token and client is None:
@@ -123,7 +123,8 @@ class OpenAICompatibleJudge:
         # Alibaba's documented Python SDK value includes the full authorization string.
         self.client = client or OpenAI(api_key=f"Authorization: Bearer {token}" if self.provider == "pai" else token,
                                        base_url=self.base_url, max_retries=0)
-        self.prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "judge.md").read_text()
+        self.prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "evidence-judge.md").read_text()
+        self.answer_prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "judge.md").read_text()
         self.usage = {"usage_observed": False}
         self.timeout = config.judge_timeout
         self.output_tokens = config.judge_output_tokens
@@ -137,9 +138,18 @@ class OpenAICompatibleJudge:
                            "evidence": evidence, "research_state": research_state}, ensure_ascii=False)
 
     def evaluate(self, question, requirements, evidence, research_state):
-        self.usage = {"usage_observed": False}
-        system = stage_prompt(self.prompt, JudgeDecision)
         payload = self.request_payload(question, requirements, evidence, research_state)
+        return self._request(JudgeDecision, self.prompt, payload)
+
+    def evaluate_answer(self, question, requirements, answer, evidence, research_state):
+        payload = json.dumps({"original_query": question, "requirements": [r.model_dump() for r in requirements],
+                              "final_answer": answer, "evidence": evidence, "research_completion": research_state}, ensure_ascii=False)
+        return self._request(QualityEvaluation, self.answer_prompt, payload)
+
+    def _request(self, schema, prompt, payload):
+        self.usage = {"usage_observed": False}
+        self.request_id = None
+        system = stage_prompt(prompt, schema)
         if token_bound(system) + token_bound(payload) + 64 > self.config.judge_input_tokens:
             raise BudgetExceeded("Judge input context limit reached.", category="input_budget")
         options = {}
@@ -147,7 +157,7 @@ class OpenAICompatibleJudge:
             options["response_format"] = {"type": "json_object"}
         elif self.json_mode == "json_schema":
             options["response_format"] = {"type": "json_schema", "json_schema": {
-                "name": "evidence_sufficiency", "strict": True, "schema": JudgeDecision.model_json_schema()}}
+                "name": "evidence_sufficiency", "strict": True, "schema": schema.model_json_schema()}}
         output_tokens = self.output_tokens
         if self.provider in {"aliyun", "kimi"}:
             provider_config = replace(self.config, provider=self.provider, model=self.model)
@@ -160,6 +170,7 @@ class OpenAICompatibleJudge:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": payload}],
             max_tokens=output_tokens, temperature=self.config.judge_temperature,
             timeout=self.timeout, **options)
+        self.request_id = safe_request_id(getattr(response, "_request_id", None))
         if response.usage:
             self.usage = {"usage_observed": True, "tokens": response.usage.total_tokens,
                           "input_tokens": response.usage.prompt_tokens, "output_tokens": response.usage.completion_tokens}
@@ -168,7 +179,7 @@ class OpenAICompatibleJudge:
         choice = response.choices[0]
         if choice.finish_reason != "stop" or not choice.message.content or getattr(choice.message, "refusal", None):
             raise ResponseError("Judge did not return complete JSON.", category="output_limit" if choice.finish_reason == "length" else "invalid_response")
-        return JudgeDecision.model_validate_json(choice.message.content, strict=True)
+        return schema.model_validate_json(choice.message.content, strict=True)
 
     def close(self):
         self.client.close()
@@ -181,7 +192,8 @@ class ResearchModelJudge:
     def __init__(self, config, backend, budget):
         from .budget import StageBackend
         self.provider, self.model = config.provider, config.model
-        self.prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "judge.md").read_text()
+        self.prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "evidence-judge.md").read_text()
+        self.answer_prompt = Path(config.judge_prompt_path).read_text() if config.judge_prompt_path else files("deepsearchagent").joinpath("prompts", "judge.md").read_text()
         self.backend = StageBackend(backend, budget, config.judge_output_tokens, config.judge_input_tokens, timeout=config.judge_timeout)
 
     def evaluate(self, question, requirements, evidence, research_state):
@@ -189,5 +201,54 @@ class ResearchModelJudge:
                               "evidence": evidence, "research_state": research_state}, ensure_ascii=False)
         return self.backend.structured(JudgeDecision, self.prompt, payload)
 
+    def evaluate_answer(self, question, requirements, answer, evidence, research_state):
+        payload = json.dumps({"original_query": question, "requirements": [r.model_dump() for r in requirements],
+                              "final_answer": answer, "evidence": evidence, "research_completion": research_state}, ensure_ascii=False)
+        self.backend.writing = True
+        return self.backend.structured(QualityEvaluation, self.answer_prompt, payload)
+
     def close(self):
         pass
+
+
+def validate_quality(result, requirements, evidence, config, *, answer_claim_ids=(), hard_issues=()):
+    """Reject invalid references; apply relevance/grounding gates independently of prose scores."""
+    result = QualityEvaluation.model_validate(result.model_dump() if isinstance(result, QualityEvaluation) else result, strict=True)
+    expected = {r.id: r for r in requirements}
+    assessed = {r.requirement_id: r for r in result.requirements_coverage}
+    if len(assessed) != len(result.requirements_coverage) or set(assessed) != set(expected):
+        raise ResponseError("Quality judge must assess every requirement exactly once.", category="evidence_reference")
+    claims = {f["id"]: f for f in evidence["findings"]}
+    sources = {s["id"] for s in evidence["sources"]}
+    for rid, entry in assessed.items():
+        if not set(entry.supporting_claim_ids) <= set(claims) or not set(entry.supporting_source_ids) <= sources:
+            raise ResponseError("Quality judge invented evidence references.", category="evidence_reference")
+        selected = [claims[fid] for fid in entry.supporting_claim_ids]
+        if any(f["requirement_id"] != rid for f in selected) or {f["source_id"] for f in selected} != set(entry.supporting_source_ids):
+            raise ResponseError("Quality evidence references mismatch requirements.", category="evidence_reference")
+    if not set(result.missing_requirements) <= set(expected):
+        raise ResponseError("Quality judge invented requirements.", category="evidence_reference")
+    for query in result.suggested_queries:
+        if not set(query.requirement_ids) <= set(result.missing_requirements):
+            raise ResponseError("Follow-up query must target missing requirements.", category="evidence_reference")
+    score = result.scores
+    result.overall_score = round(score.relevance * .3 + score.requirement_coverage * .25 + score.factual_grounding * .2
+                                 + score.citation_quality * .1 + score.analytical_quality * .1 + score.uncertainty_handling * .05, 3)
+    failures = list(hard_issues)
+    for rid, entry in assessed.items():
+        if expected[rid].critical and (entry.status != "COVERED" or not entry.supporting_claim_ids
+                                      or not set(entry.supporting_claim_ids) <= set(answer_claim_ids)):
+            failures.append(f"Critical requirement {rid} lacks covered, cited answer evidence.")
+        if entry.status == "COVERED" and any(f["evidence_status"] != "SUPPORTED" or not f["evidence"] for f in (claims[fid] for fid in entry.supporting_claim_ids)):
+            failures.append(f"Requirement {rid} relies on incomplete or unverified evidence.")
+    if result.decision == "PASS":
+        if (min(score.relevance, score.requirement_coverage) < config.quality_min_primary_score
+                or min(score.factual_grounding, score.citation_quality) < config.quality_min_grounding_score
+                or result.overall_score < config.quality_min_overall_score):
+            failures.append("Mandatory relevance, coverage or grounding score threshold failed.")
+        failures.extend(result.critical_issues + result.unsupported_claims + result.citation_issues + result.missing_requirements)
+        if failures:
+            result = result.model_copy(update={"decision": "REVISE", "critical_issues": list(dict.fromkeys(failures)),
+                "actionable_feedback": list(dict.fromkeys([*result.actionable_feedback, *failures])),
+                "recommended_next_action": "Correct the identified deficiencies using verified evidence; communicate remaining evidence gaps."})
+    return result

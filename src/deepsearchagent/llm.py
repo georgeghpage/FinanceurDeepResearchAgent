@@ -2,6 +2,7 @@
 
 import time
 import threading
+from uuid import uuid4
 from collections.abc import Callable
 from typing import Protocol, TypeVar
 
@@ -58,13 +59,16 @@ class Backend(Protocol):
 
     def structured(self, schema: type[T], instructions: str, payload: str, *,
                    output_tokens: int | None = None, timeout: float | None = None,
-                   system_prompt: str | None = None) -> T: ...
+                   system_prompt: str | None = None, continuation: str = "",
+                   thinking_enabled: bool | None = None, reasoning_effort: str | None = None,
+                   on_partial: Callable[[str], None] | None = None) -> T: ...
 
 
 class OpenAICompatibleBackend:
     def __init__(self, config: Config, api_key: str,
                  trace: Callable[[dict], None] | None = None,
                  diagnostic_trace: Callable[[dict], None] | None = None) -> None:
+        self.trace_namespace = uuid4().hex
         self.config = config
         # Retries are disabled so a run's request count and timeout stay explicit.
         self.client = OpenAI(api_key=api_key, base_url=config.base_url, max_retries=0)
@@ -81,6 +85,18 @@ class OpenAICompatibleBackend:
         self._budget_lock = threading.RLock()
         self._local = threading.local()
 
+    def for_model(self, model: str, provider: str | None = None):
+        from dataclasses import replace
+        config = replace(self.config, provider=provider or self.config.provider, model=model, research_model=None,
+                         input_price_per_million=self.config.final_writer_input_price_per_million,
+                         output_price_per_million=self.config.final_writer_output_price_per_million,
+                         cached_price_per_million=None, cache_write_price_per_million=None)
+        from .config import require_api_key
+        key = self.client.api_key if config.provider == self.config.provider else require_api_key(config.provider)
+        backend = type(self)(config, key, self.trace, self.diagnostic_trace)
+        backend.cancellation = self.cancellation
+        return backend
+
     def close_stream(self) -> None:
         with self._stream_lock:
             streams = list(self._streams.values())
@@ -95,9 +111,16 @@ class OpenAICompatibleBackend:
 
     def _emit(self, event: dict) -> None:
         self._check_cancelled()
+        from .diagnostics import CALL_CONTEXT
+        call_id = event.get("call_id", getattr(self._local, "call_id", None))
+        context = CALL_CONTEXT.get()
+        event = {**context, **event}
+        if call_id is not None:
+            event["span_id"] = f"{self.trace_namespace}:{call_id}"
         if self.trace is not None:
             self.trace(event)
-        if self.diagnostic_trace is not None and self.diagnostic_trace != self.trace:
+        if (self.diagnostic_trace is not None and self.diagnostic_trace != self.trace
+                and event.get("kind") not in {"thinking_delta", "output_delta"}):
             self.diagnostic_trace(event)
 
     def _options(self) -> dict:
@@ -131,11 +154,13 @@ class OpenAICompatibleBackend:
 
     def structured(self, schema: type[T], instructions: str, payload: str,
                    *, output_tokens: int | None = None, timeout: float | None = None,
-                   system_prompt: str | None = None, continuation: str = "") -> T:
+                   system_prompt: str | None = None, continuation: str = "",
+                   thinking_enabled: bool | None = None, reasoning_effort: str | None = None,
+                   on_partial: Callable[[str], None] | None = None) -> T:
         self._local.usage = {"usage_observed": False}
         self.last_failure = None
-        stage = {"ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract", "EvidenceExtraction": "extract",
-                 "Verification": "verify", "JudgeDecision": "verify", "ReportDraft": "write", "ReportAudit": "validate"}.get(schema.__name__, "model")
+        stage = {"PlanningBrief": "plan", "QueryBatch": "plan", "ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract", "EvidenceExtraction": "extract",
+                 "Verification": "verify", "JudgeDecision": "verify", "ReportDraft": "write", "ReportAudit": "validate", "QualityEvaluation": "validate"}.get(schema.__name__, "model")
         try:
             with self._budget_lock:
                 options = self._options()
@@ -144,6 +169,11 @@ class OpenAICompatibleBackend:
                 options["max_tokens"] = min(output_tokens, self.config.max_tokens - self.tokens_used)
             if timeout is not None:
                 options["timeout"] = min(timeout, options["timeout"])
+            if thinking_enabled is not None or reasoning_effort is not None:
+                options.pop("reasoning_effort", None)
+                options.pop("extra_body", None)
+                options.update(inference_options(self.config, thinking_enabled=thinking_enabled,
+                                                 reasoning_effort=reasoning_effort))
         except BudgetExceeded as exc:
             self.last_failure = failure_from_exception(exc, provider="agent", stage=stage, operation="budget_check")
             self._emit({"kind": "llm_error", "diagnostic": self.last_failure.model_dump(),
@@ -165,7 +195,8 @@ class OpenAICompatibleBackend:
         if request["max_tokens"] <= 0:
             raise BudgetExceeded("Model context window reached.", category="input_budget")
         self._local.continuation = continuation
-        if self.trace is not None:
+        self._local.on_partial = on_partial
+        if self.trace is not None or on_partial is not None:
             return self._streamed(schema, request)
         started = time.monotonic()
         meta = self._start_metadata(schema, request)
@@ -176,6 +207,8 @@ class OpenAICompatibleBackend:
             response = self.client.chat.completions.create(**request)
             self._check_cancelled()
             self._record(response)
+            from .diagnostics import safe_request_id
+            meta["request_id"] = safe_request_id(getattr(response, "_request_id", None))
             stats.update(self._usage(getattr(response, "usage", None)))
             if not response.choices:
                 raise ResponseError(f"{self.config.provider.title()} returned no choices.", category="empty_response")
@@ -184,6 +217,8 @@ class OpenAICompatibleBackend:
             stats["output_chars"] = len(choice.message.content or "")
             stats["reasoning_chars"] = len(getattr(choice.message, "reasoning_content", "") or "")
             content = append_suffix(continuation, choice.message.content or "")
+            if on_partial and content:
+                on_partial(content)
             if not getattr(choice.message, "refusal", None) and finish_reason in {"length", None}:
                 raise IncompleteResponse(content, category="output_limit" if finish_reason == "length" else "missing_finish")
             self._validate_completion(finish_reason, choice.message.content, getattr(choice.message, "refusal", None))
@@ -197,10 +232,12 @@ class OpenAICompatibleBackend:
 
     def _start_metadata(self, schema, request: dict) -> dict:
         return {"call_id": getattr(self._local, "call_id", self.calls), "schema": schema.__name__, "provider": self.config.provider,
-                "stage": {"ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract", "EvidenceExtraction": "extract",
-                          "Verification": "verify", "JudgeDecision": "verify", "ReportDraft": "write", "ReportAudit": "validate"}.get(schema.__name__, "model"),
+                "stage": {"PlanningBrief": "plan", "QueryBatch": "plan", "ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract", "EvidenceExtraction": "extract",
+                          "Verification": "verify", "JudgeDecision": "verify", "ReportDraft": "write", "ReportAudit": "validate", "QualityEvaluation": "validate"}.get(schema.__name__, "model"),
                 "model": self.config.model, "operation": "chat_completion",
-                "timeout_seconds": request["timeout"], "max_output_tokens": request["max_tokens"]}
+                "timeout_seconds": request["timeout"], "max_output_tokens": request["max_tokens"],
+                "reasoning_effort": request.get("reasoning_effort"),
+                "thinking_enabled": request.get("extra_body", {}).get("enable_thinking")}
 
     @staticmethod
     def _usage(usage) -> dict:
@@ -230,6 +267,10 @@ class OpenAICompatibleBackend:
         failure = failure_from_exception(
             exc, provider=self.config.provider, stage=meta["stage"], operation="chat_completion",
             call_id=meta["call_id"], finish_reason=finish_reason)
+        from .diagnostics import CALL_CONTEXT
+        failure = failure.model_copy(update={"correlation_id": CALL_CONTEXT.get().get("invocation_id"),
+                                             "upstream_span_id": f"{self.trace_namespace}:{meta['call_id']}"})
+        exc.research_diagnostic = failure
         self.last_failure = failure
         self._emit({"kind": "llm_error", **meta, **stats,
                     "duration_seconds": round(time.monotonic() - started, 3),
@@ -254,6 +295,8 @@ class OpenAICompatibleBackend:
         try:
             stream = self.client.chat.completions.create(
                 **request, stream=True, stream_options={"include_usage": True})
+            from .diagnostics import safe_request_id
+            meta["request_id"] = safe_request_id(getattr(getattr(stream, "response", None), "headers", {}).get("x-request-id"))
             with self._stream_lock:
                 self._active_stream = stream
                 self._streams[threading.get_ident()] = stream
@@ -285,6 +328,9 @@ class OpenAICompatibleBackend:
                     if delta.content:
                         stats["output_chars"] += len(delta.content)
                         content.append(delta.content)
+                        on_partial = getattr(self._local, "on_partial", None)
+                        if on_partial:
+                            on_partial(append_suffix(getattr(self._local, "continuation", ""), "".join(content)))
                         emit({"kind": "output_delta", "call_id": call_id, "text": delta.content})
                     if (reasoning or delta.content) and stats["time_to_first_delta_seconds"] is None:
                         stats["time_to_first_delta_seconds"] = round(time.monotonic() - started, 3)
@@ -302,9 +348,9 @@ class OpenAICompatibleBackend:
             return result
         except Exception as exc:
             self._failed(exc, meta, stats, started, finish_reason)
-            if not isinstance(exc, (BudgetExceeded, ResponseError)) and content:
+            if not refused and content:
                 diagnostic = failure_from_exception(exc, provider=self.config.provider, stage=meta["stage"], operation="stream")
-                if diagnostic.category in {"connection_error", "protocol_error", "timeout"}:
+                if diagnostic.category in {"connection_error", "protocol_error", "timeout", "request_timeout", "time_budget"}:
                     raise IncompleteResponse(append_suffix(getattr(self._local, "continuation", ""), "".join(content)),
                                              category=diagnostic.category) from exc
             raise

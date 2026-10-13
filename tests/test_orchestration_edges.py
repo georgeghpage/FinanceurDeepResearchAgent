@@ -62,7 +62,7 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(
                 ResearchAgent(
                     backend,
-                    Config(session_dir=root),
+                    Config(session_dir=root, search_requests_per_second=10000),
                     SearchRouter(FakeAsyncSearch(delay=0)),
                     cancellation=cancellation,
                     judge=FakeJudge(),
@@ -115,13 +115,16 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as root:
             state, report = await ResearchAgent(
                 AutoBackend(),
-                Config(session_dir=root),
+                Config(session_dir=root, search_requests_per_second=10000),
                 SearchRouter(FakeAsyncSearch(delay=0)),
                 judge=judge,
             ).arun("q")
             self.assertEqual(state.stop_reason, "no_tasks")
             self.assertEqual(state.search_calls, 15)
-            self.assertIn("No useful new targeted queries", report)
+            self.assertTrue(
+                any("No useful new targeted queries" in w for w in state.warnings)
+            )
+        self.assertNotIn("No useful new targeted queries", report)
 
     async def test_judge_budget_exhaustion_still_reserves_best_effort_writer(self):
         with tempfile.TemporaryDirectory() as root:
@@ -141,7 +144,7 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
             backend = AutoBackend()
             agent = ResearchAgent(
                 backend,
-                Config(session_dir=root),
+                Config(session_dir=root, search_requests_per_second=10000),
                 SearchRouter(FakeAsyncSearch()),
                 judge=FakeJudge(),
             )
@@ -166,7 +169,8 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
             ).arun("q")
         self.assertEqual(state.stop_reason, "no_tasks")
         self.assertIsNone(state.judge)
-        self.assertIn("classification was unavailable", report)
+        self.assertIn("could not be independently verified", report)
+        self.assertNotIn("classification was unavailable", report)
         self.assertNotIn("CANARY", report)
 
     async def test_cancelled_classifier_releases_reservation_and_skips_writer(self):
@@ -179,7 +183,7 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as root:
             agent = ResearchAgent(
                 AutoBackend(),
-                Config(session_dir=root),
+                Config(session_dir=root, search_requests_per_second=10000),
                 SearchRouter(FakeAsyncSearch(delay=0)),
                 judge=CancelJudge(),
             )
@@ -199,7 +203,7 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as root:
             agent = ResearchAgent(
                 AutoBackend(),
-                Config(session_dir=root),
+                Config(session_dir=root, search_requests_per_second=10000),
                 SearchRouter(provider),
                 cancellation=signal,
                 trace=events.append,
@@ -231,7 +235,7 @@ class OrchestrationEdgeTests(unittest.IsolatedAsyncioTestCase):
             search = BlockedSearch()
             agent = ResearchAgent(
                 AutoBackend(),
-                Config(session_dir=root),
+                Config(session_dir=root, search_requests_per_second=10000),
                 SearchRouter(search),
                 judge=FakeJudge(),
             )

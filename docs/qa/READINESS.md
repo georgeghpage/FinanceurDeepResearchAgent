@@ -1,4 +1,12 @@
-# Release-readiness evidence — 2026-10-12
+# Release-readiness evidence — updated 2026-10-13
+
+The research/report upgrade is implemented and verified offline. Current evidence: **254 backend tests (251 passed, three live skips)** with required real PostgreSQL; **84 full browser-matrix checks plus six final autosave/conflict checks** across Chromium/Firefox/WebKit; **16 visual cases / 17 PNGs** compared without baseline updates; scoped checks, npm advisory audit and exact wheel asset verification passed. See [upgrade progress](../IMPLEMENTATION_PROGRESS.md) for commands/artifacts and [writer evaluation](../WRITER_EVALUATION.md) for the unrun live comparison.
+
+Current coverage is **91.671% lines / 84.975% branches**. Critical branch coverage: budget **95.714%**, evidence store **91.176%**, judge **98.438%**, orchestrator **86.620%**. The 95% orchestration release gate remains unmet. Live provider compatibility, empirical writing quality, human answer evaluation, hosted CI and production performance remain unverified. Edited documents are separately autosaved with revision conflict protection; tables, code, formulas and charts are now implemented. The historical QA load/security/consolidation snapshots below were not regenerated for this upgrade.
+
+---
+
+## Historical QA snapshot — 2026-10-12
 
 The implemented QA infrastructure can reproduce deterministic software regressions across the default research pipeline, provider boundaries, PostgreSQL and browser UI. **Production readiness is not established.** Orchestration coverage remains below the requested gate; live providers and human-reviewed research accuracy were not validated.
 
@@ -57,6 +65,6 @@ The load tool measures plan/search/extract/verify/write/validate stage wall time
 6. Perform manual screen-reader/keyboard/zoom/touch review and longer soak/transport testing on deployment infrastructure. The automated axe result is not a full accessibility certification.
 7. Treat snapshots as audit files. Multi-file crash consistency and durable research checkpoint resume are unsupported; saved UI traces/history replay safely without automatically restarting paid research.
 
-No known critical dependency vulnerability was reported by the executed scans. Deterministic prompt/data/reference/path boundaries passed; resistance of actual LLMs to adversarial source instructions is unverified. Authentication/accounts, arbitrary URL fetching, distributed tracing, dark mode and report tables/code blocks are not implemented features and were not fabricated for test coverage.
+No known critical dependency vulnerability was reported by the executed scans. Deterministic prompt/data/reference/path boundaries passed; resistance of actual LLMs to adversarial source instructions is unverified. Authentication/accounts, arbitrary URL fetching, distributed tracing and dark mode remain unimplemented. Report tables/code/formula/chart features were added in the 2026-10-13 upgrade.
 
 Canonical generated evidence: `reports/qa/results.json`, `coverage.json`, `coverage-html/`, `browser/results.json`, `visual/results.json`, `evaluation.json`, `load/*.json`, `python-audit.json`, `npm-audit.json`, and `consolidated/QUALITY_REPORT.md` / `results.json`. Generated reports are ignored in Git; this documentation preserves the measured snapshot. See the [32-category matrix](MATRIX.md) and [execution guide](TESTING.md).

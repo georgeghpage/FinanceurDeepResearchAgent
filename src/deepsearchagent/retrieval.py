@@ -10,7 +10,7 @@ from .tools.retry import TRANSIENT as TRANSIENT
 from .tools.search import SEARCH_CONTEXT
 
 
-async def retrieve(queries, router, budget, trace):
+async def retrieve(queries, router, budget, trace, on_result=None):
     if getattr(router, "budget", None) is not budget:
         router.configure(budget.config, budget)
     router.trace = trace
@@ -28,4 +28,21 @@ async def retrieve(queries, router, budget, trace):
         finally:
             SEARCH_CONTEXT.reset(context)
 
-    return await asyncio.gather(*(one(q) for q in queries), return_exceptions=True)
+    async def completed(query):
+        try:
+            result = await one(query)
+        except Exception as exc:
+            result = exc
+        if on_result:
+            on_result(query, result)
+        return result
+
+    tasks = [asyncio.create_task(completed(q)) for q in queries]
+    try:
+        return await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await router.aclose()

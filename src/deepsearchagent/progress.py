@@ -19,7 +19,7 @@ STAGES = {
     "validate": ("validating", "Validating the answer…"),
     "finalize": ("finalizing", "Finalizing research…"),
 }
-SCHEMAS = {"ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract",
+SCHEMAS = {"PlanningBrief": "plan", "QueryBatch": "plan", "ResearchPlan": "plan", "EvidencePlan": "plan", "Extraction": "extract",
            "EvidenceExtraction": "extract", "Verification": "verify", "JudgeDecision": "verify",
            "ReportDraft": "write", "ReportAudit": "validate"}
 
@@ -44,7 +44,7 @@ class ResearchProgress:
             self.stage = event.get("stage") or SCHEMAS.get(event.get("schema"))
             status = STAGES.get(self.stage)
         elif kind in {"llm_retry", "llm_continuation"}:
-            status = ("recovering", "Recovering the current research step…")
+            status = STAGES.get(self.stage)
         elif kind == "llm_recovered":
             status = STAGES.get(self.stage)
         elif kind == "search_start":
@@ -60,7 +60,7 @@ class ResearchProgress:
         elif kind == "search_error":
             self.active.discard(event.get("search_id"))
         elif kind == "search_retry" and self.stage == "search" and not self.active:
-            status = ("retrying", "Search temporarily unavailable. Retrying…")
+            status = STAGES.get(self.stage)
         elif kind == "search_degraded" and self.stage == "search" and not self.active:
             status = ("continuing", "Continuing with available sources…")
         if not status:

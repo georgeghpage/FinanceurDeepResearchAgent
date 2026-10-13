@@ -26,7 +26,7 @@ class APIProbe(BaseModel):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--research", action="store_true", help="Also run the default 15-query multi-agent flow (uses paid APIs)")
+    parser.add_argument("--research", action="store_true", help="Also run the bounded multi-stage research flow (uses paid APIs)")
     parser.add_argument("--direct-tavily", action="store_true", help="Ignore system/environment proxy settings for Tavily in this test only")
     parser.add_argument("--log-dir", type=Path, default=Path("reports/diagnostics"))
     args = parser.parse_args()
@@ -44,7 +44,7 @@ def main() -> None:
             print(json.dumps({"check": "logging", "ok": False, "message": "Could not save diagnostic log."}), flush=True)
 
     trace(run_metadata(config))
-    backend = backend_class(replace(config, request_timeout=45, max_seconds=60, max_output_tokens=256), model_key, trace=trace)
+    backend = backend_class(replace(config, request_timeout=45, max_seconds=60, max_output_tokens=min(config.max_output_tokens, 8192)), model_key, trace=trace)
     try:
         probe = backend.structured(APIProbe, "API connectivity check. Return JSON with ok set to true.", 'Return {"ok":true}.')
         passed = passed and probe.ok
@@ -75,11 +75,11 @@ def main() -> None:
             question = "Connectivity smoke test: What is Tavily MCP? Establish its official documented purpose and how it exposes search. Return a short report with source citations."
             state, report = ResearchAgent(backend, config, SearchRouter(web), trace=trace,
                 progress=lambda message: print(json.dumps({"check": "research_progress", "message": message}), flush=True)).run(question)
-            passed = passed and state.stop_reason == "coverage"
+            passed = passed and state.status == "COMPLETE"
             args.log_dir.mkdir(parents=True, exist_ok=True)
             base.with_suffix(".state.json").write_text(state.model_dump_json(indent=2) + "\n", encoding="utf-8")
             base.with_suffix(".md").write_text(report, encoding="utf-8")
-            print(json.dumps({"check": "research", "ok": state.stop_reason == "coverage", "stop_reason": state.stop_reason,
+            print(json.dumps({"check": "research", "ok": state.status == "COMPLETE", "stop_reason": state.stop_reason,
                               "failure": state.failure.model_dump() if state.failure else None,
                               "sources": len(state.sources), "search_calls": state.search_calls,
                               "api_calls": state.api_calls, "tokens": state.tokens_used,

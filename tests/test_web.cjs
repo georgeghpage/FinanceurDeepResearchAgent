@@ -384,8 +384,8 @@ test("provider and stage explain partial results and survive trace download", as
     await ui.submit();
     assert.equal(calls, 1);
     assert.equal(ui.nodes["answer-section"].hidden, false);
-    assert.equal(ui.nodes.error.hidden, false);
-    assert.equal(ui.nodes.error.textContent, failure.message);
+    assert.equal(ui.nodes.error.hidden, true);
+    assert.ok(ui.nodes["dashboard-issue-list"].textContent.includes(failure.message));
     assert.doesNotMatch(ui.nodes.events.textContent, /authentication|output_limit|HTTP/);
     ui.nodes["download-trace"].click();
     assert.deepEqual(JSON.parse(await ui.blobs[0].text()).at(-1).failure, failure);
@@ -502,7 +502,76 @@ test("dashboard renders live calls, filtering and inspector from the real stream
   assert.equal(ui.nodes["dashboard-tokens"].textContent, "0");
 });
 
-test("configured default is sent on every POST retry without model discovery", async () => {
+test("research stages, query names and failure causes are visible without opening a call", async () => {
+  const failure = { provider: "tavily", stage: "search", operation: "initialize", category: "quota_exhausted",
+    origin: "downstream", downstream_effects: ["search / search"],
+    http_status: 432, message: "Provider credits or quota are exhausted." };
+  const data = [
+    { kind: "llm_start", stage: "plan", schema: "PlanningBrief", call_id: 1 },
+    { kind: "llm_complete", call_id: 1 },
+    { kind: "llm_start", stage: "plan", schema: "QueryBatch", call_id: 2 },
+    { kind: "llm_complete", call_id: 2 },
+    { kind: "search_start", search_id: 13, query_id: "Q7", provider: "tavily", query: "company revenue <script>" },
+    { kind: "search_error", search_id: 13, query_id: "Q7", diagnostic: failure },
+    { kind: "search_degraded", search_id: 13, query_id: "Q7", diagnostic: failure, fallback_required: true },
+    { type: "result", status: "PARTIAL", stop_reason: "round_limit", report: "# Partial", sources: 0,
+      stop_explanation: "The research round limit was reached before all evidence requirements were covered.",
+      warnings: ["Revenue remains unsupported."], issues: [] },
+  ].map((e, i) => ({ ...e, type: e.type || "trace", sequence: i + 1 }));
+  const ui = harness(async () => response(wire(data)));
+  await ui.submit();
+  const rows = ui.nodes["dashboard-rows"].textContent;
+  assert.match(rows, /Define research plan/);
+  assert.match(rows, /Generate search queries/);
+  assert.match(rows, /Search Q7: company revenue <script>/);
+  assert.doesNotMatch(rows, /tavily_search/);
+  assert.match(rows, /call 13.*Quota exhausted/);
+  assert.equal(ui.nodes["dashboard-issues"].hidden, false);
+  assert.match(ui.nodes["dashboard-outcome"].textContent, /round limit/);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /HTTP 432.*credits or quota/);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /continued with available evidence/);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /Revenue remains unsupported/);
+  assert.equal(ui.nodes["dashboard-issue-list"].children.length, 2);
+  assert.equal(walk(ui.nodes["dashboard-issues"]).some(n => n.tagName === "script"), false);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /Downstream effectssearch \/ search/);
+  const toolButton = walk(ui.nodes["dashboard-rows"].children[2]).find(n => n.tagName === "button");
+  await toolButton.click();
+  assert.match(ui.nodes["dashboard-detail-values"].textContent, /Failed operationinitialize/);
+  assert.match(ui.nodes["dashboard-detail-values"].textContent, /Downstream effectssearch \/ search/);
+});
+
+test("planning recovery and error types survive result-only replay and reset", async () => {
+  const issue = { kind: "planning_recovered", schema: "QueryBatch", recovered: true,
+    recovery: "Using available queries and generating missing searches from plan requirements.",
+    diagnostic: { provider: "kimi", stage: "plan", operation: "queries", category: "output_limit",
+      message: "Model reached the output token limit before completing JSON." } };
+  const result = { ...events.at(-1), status: "PARTIAL", issues: [issue], warnings: [],
+    stop_explanation: "Evidence coverage was reached with limitations." };
+  const ui = harness(async () => response(wire([result])));
+  await ui.submit();
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /Generate search queries · Output limit/);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /before completing JSON/);
+  assert.match(ui.nodes["dashboard-issue-list"].textContent, /Using available queries/);
+  assert.match(ui.nodes["dashboard-outcome"].textContent, /with limitations/);
+  await ui.nodes["new-chat"].click();
+  assert.equal(ui.nodes["dashboard-issues"].hidden, true);
+  assert.equal(ui.nodes["dashboard-issue-list"].children.length, 0);
+});
+
+test("successful retries keep the original failure and describe recovery", () => {
+  const state = new TraceDashboardState();
+  state.receive({ kind: "search_start", search_id: 1, query_id: "Q1", invocation_id: "query-1", provider: "tavily" });
+  const failure = { provider: "tavily", stage: "search", operation: "search", category: "timeout", message: "Provider request timed out." };
+  state.receive({ kind: "search_error", search_id: 1, invocation_id: "query-1", diagnostic: failure });
+  state.receive({ kind: "search_recovered", search_id: 2, invocation_id: "query-1" });
+  state.receive({ type: "result", stop_reason: "coverage", issues: [] });
+  const issue = [...state.issues.values()][0];
+  assert.equal(issue.diagnostic.category, "timeout");
+  assert.equal(issue.recovered, true);
+  assert.match(issue.recovery, /completed successfully/);
+});
+
+test("server configuration is used on every POST retry without model overrides or discovery", async () => {
   const requests = [];
   const ui = harness(async (path, options) => {
     requests.push({ path, body: JSON.parse(options.body) });
@@ -511,8 +580,8 @@ test("configured default is sent on every POST retry without model discovery", a
   });
   await ui.submit();
   assert.equal(requests.length, 2);
-  assert.equal(requests[0].body.provider, "aliyun");
-  assert.equal(requests[0].body.model, "deepseek-v4.1-flash");
+  assert.equal(requests[0].body.provider, undefined);
+  assert.equal(requests[0].body.model, undefined);
   assert.deepEqual(requests[1].body, requests[0].body);
   assert.equal(ui.nodes.provider, undefined);
   assert.equal(ui.nodes.model, undefined);
@@ -688,7 +757,8 @@ test("status duplicates and internal chunks do not flicker or create activity ro
   ])));
   await until(() => ui.nodes["activity-title"].textContent === "Searching the web…");
   assert.equal(ui.nodes.events.children.length, 1);
-  assert.equal(ui.nodes.error.hidden, true);
+  assert.equal(ui.nodes.error.hidden, false);
+  assert.doesNotMatch(ui.nodes.error.textContent, /PRIVATE/);
   assert.doesNotMatch(ui.nodes.events.textContent, /PRIVATE|Planning/);
   controller.enqueue(encoder.encode(wire([
     { type: "status", code: "retrying", message: "Search temporarily unavailable. Retrying…" },
@@ -724,4 +794,33 @@ test("Enter submits, Shift+Enter and composing text preserve editing", () => {
   key({ key: "Enter", shiftKey: true });
   key({ key: "Enter", shiftKey: false, isComposing: true });
   assert.equal(submissions, 1);
+});
+
+test("model call namespaces preserve independent writers and evaluator decisions", () => {
+  const { TraceDashboardState } = require('../src/deepsearchagent/web/dashboard.js');
+  const state = new TraceDashboardState();
+  state.receive({ kind: 'stage_start', task_id: 'writer-task', stage: 'write' });
+  state.receive({ kind: 'llm_start', call_id: 1, span_id: 'research:1', model: 'deepseek-v4.1-flash', invocation_id: 'research-op', parent_id: 'research-task', elapsed_seconds: 0 });
+  state.receive({ kind: 'llm_start', call_id: 1, span_id: 'writer:1', model: 'qwen3.8-flash', invocation_id: 'writer-op', parent_id: 'writer-task', elapsed_seconds: 1 });
+  state.receive({ kind: 'llm_complete', call_id: 1, span_id: 'writer:1', elapsed_seconds: 3 });
+  assert.equal(state.spans.size, 2);
+  assert.equal(state.spans.get('research:1').status, 'running');
+  assert.equal(state.spans.get('writer:1').status, 'complete');
+  assert.equal(state.tasks.get('writer-task').stage, 'write');
+  state.receive({ kind: 'llm_start', call_id: 'judge', schema: 'QualityEvaluation', model: 'qwen3.8-max' });
+  state.receive({ kind: 'quality_evaluation', call_id: 'judge', decision: 'REVISE', overall_score: 2.5, scores: { relevance: 2 }, rejection_reasons: ['Missing requested comparison'], confidence: .8 });
+  assert.equal(state.spans.get('model-judge').evaluation.decision, 'REVISE');
+  assert.deepEqual(state.spans.get('model-judge').evaluation.reasons, ['Missing requested comparison']);
+});
+
+test("diagnostic updates merge retry history and recovered errors stop counting as active", async () => {
+  const issue = { type: 'diagnostic', error_id: 'stable', invocation_id: 'call-group', attempt: 1, resolution: 'active', severity: 'warning', timestamp: '2026-10-13T01:00:00Z',
+    diagnostic: { provider: 'aliyun', stage: 'write', operation: 'chat_completion', category: 'rate_limit', message: 'Provider rate limit.', http_status: 429, root_cause: 'Provider returned HTTP 429.', cause_confidence: 'confirmed' } };
+  const ui = harness(async () => response(wire([issue, { ...issue, attempt: 2, resolution: 'recovered', recovered: true, recovery: 'A subsequent attempt succeeded.' }, events.at(-1)])));
+  await ui.submit();
+  assert.equal(ui.nodes['error-count'].hidden, true);
+  assert.match(ui.nodes['error-center-summary'].textContent, /0 unresolved · 1 recovered/);
+  assert.equal(ui.nodes['dashboard-issue-list'].children.length, 1);
+  await ui.nodes['dashboard-issue-list'].children[0].children[1].click();
+  assert.match(ui.nodes['dashboard-issue-list'].textContent, /history retained/);
 });

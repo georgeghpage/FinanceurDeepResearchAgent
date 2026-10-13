@@ -46,6 +46,13 @@ class ChatStore:
                     sequence INTEGER NOT NULL,
                     payload JSONB NOT NULL,
                     PRIMARY KEY (chat_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS report_documents (
+                    chat_id UUID PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+                    content JSONB NOT NULL,
+                    markdown TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
             # Migrate existing stores to represent cancellation distinctly.
@@ -113,3 +120,22 @@ class ChatStore:
             events = conn.execute("SELECT payload FROM chat_events WHERE chat_id=%s ORDER BY sequence",
                                   (chat_id,)).fetchall()
         return {**self.serialize(row), "messages": messages, "events": [row["payload"] for row in events]}
+
+    def get_document(self, chat_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT content, markdown, revision FROM report_documents WHERE chat_id=%s",
+                               (chat_id,)).fetchone()
+        return row
+
+    def save_document(self, chat_id: str, content: dict, markdown: str, revision: int) -> dict | None:
+        """Compare-and-swap keeps stale tabs from overwriting newer edits."""
+        with self.connect() as conn:
+            if revision == 0:
+                return conn.execute(
+                    "INSERT INTO report_documents (chat_id, content, markdown) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (chat_id) DO NOTHING RETURNING revision",
+                    (chat_id, Jsonb(content), markdown)).fetchone()
+            return conn.execute(
+                "UPDATE report_documents SET content=%s, markdown=%s, revision=revision+1, updated_at=now() "
+                "WHERE chat_id=%s AND revision=%s RETURNING revision",
+                (Jsonb(content), markdown, chat_id, revision)).fetchone()

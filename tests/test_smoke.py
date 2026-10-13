@@ -15,14 +15,14 @@ class LiveSmokeTests(unittest.TestCase):
             self.skipTest("Live smoke disabled; use run_tests.py --suite smoke --live")
 
     def test_research_model_tiny_json(self):
-        provider = os.getenv("LLM_PROVIDER", "kimi")
+        config = Config.from_env(
+            max_calls=1, max_tokens=12000, max_output_tokens=8192, request_timeout=60
+        )
+        provider = config.provider
         try:
             key = require_api_key(provider)
         except ValueError:
             self.skipTest("Research provider credential unavailable")
-        config = Config.from_env(
-            max_calls=1, max_tokens=2000, max_output_tokens=128, request_timeout=20
-        )
         backend_type = AliyunBackend if provider == "aliyun" else KimiBackend
         backend = backend_type(config, key)
         try:

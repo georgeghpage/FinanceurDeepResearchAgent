@@ -59,6 +59,28 @@ class HistoryTests(unittest.TestCase):
         run.emit({"type": "result", "report": "# Answer\n\nSaved 收入", "stop_reason": reason})
         return run.events
 
+    def test_document_edit_api_is_independent_and_rejects_stale_writes(self):
+        chat_id = str(uuid4())
+        self.store.create(chat_id, "Editable research")
+        events = self.result(chat_id)
+        content = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Edited"}]}]}
+        payload = {"content": content, "markdown": "Edited", "revision": 0}
+        status, data = self.request("POST", f"/api/documents/{chat_id}", payload)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["revision"], 1)
+        status, _ = self.request("POST", f"/api/documents/{chat_id}", payload)
+        self.assertEqual(status, 409)
+        status, data = self.request("GET", f"/api/documents/{chat_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)["document"]["content"], content)
+        self.assertEqual(self.store.get(chat_id)["events"], events)
+        self.assertEqual(type(self.store)(self.url).get_document(chat_id)["markdown"], "Edited")
+        status, _ = self.request("POST", f"/api/documents/{chat_id}", {**payload, "revision": -1})
+        self.assertEqual(status, 400)
+        status, _ = self.request("POST", f"/api/documents/{chat_id}", payload,
+                                 {"Origin": "https://attacker.invalid"})
+        self.assertEqual(status, 403)
+
     def test_messages_trace_and_status_survive_new_store_instance(self):
         chat_id = str(uuid4())
         self.store.create(chat_id, "What's revenue? <script>")
@@ -149,13 +171,13 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("history_error", run.events[-1])
         self.assertNotIn("SECRET", json.dumps(run.events))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_explicit_partial_failed_and_cancelled_results_survive_storage(self):
         for state, reason, expected in (("PARTIAL", "coverage", "partial"), ("FAILED", "error", "failed"), ("CANCELLED", "cancelled", "cancelled")):
             chat_id = str(uuid4())
             self.store.create(chat_id, "Question")
             self.store.save_event(chat_id, {"type": "result", "sequence": 1, "report": "# Result", "status": state, "stop_reason": reason})
             self.assertEqual(self.store.get(chat_id)["status"], expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

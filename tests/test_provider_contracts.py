@@ -56,6 +56,8 @@ class ProviderContractTests(unittest.TestCase):
             ("kimi", "kimi-k3"),
             ("kimi", "older-model"),
             ("aliyun", "qwen-plus"),
+            ("aliyun", "qwen3.8-max"),
+            ("aliyun", "qwen3.7-plus"),
         ]:
             with self.subTest(provider=provider, model=model):
                 seen = []
@@ -93,7 +95,7 @@ class ProviderContractTests(unittest.TestCase):
                     body.get("reasoning_effort"), "low" if model == "kimi-k3" else None
                 )
                 self.assertEqual(
-                    body.get("enable_thinking"), False if provider == "aliyun" else None
+                    body.get("enable_thinking"), False if model == "qwen-plus" else None
                 )
 
     def test_sdk_http_status_matrix_is_bounded_and_secret_safe(self):
@@ -202,7 +204,8 @@ class ProviderContractTests(unittest.TestCase):
                     return httpx.Response(200, json=completion(content, finish=finish))
 
                 judge = OpenAICompatibleJudge(
-                    Config(judge_provider="pai"), client=self.client(respond)
+                    Config(judge_provider="pai", judge_model="pai-judge"),
+                    client=self.client(respond),
                 )
                 if valid:
                     self.assertEqual(judge.evaluate("q", [], {}, {}).decision, "READY")
@@ -241,8 +244,8 @@ class ProviderContractTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(result.sources), 1)
-            self.assertLessEqual(len(result.documents[0]["content"]), 8000)
-            self.assertTrue(result.documents[0]["truncated"])
+            self.assertEqual(result.documents[0]["content"], entry["raw_content"])
+            self.assertFalse(result.documents[0]["truncated"])
             self.assertEqual(result.sources[0].title, "example.com")
             self.assertIsNone(result.sources[0].published_at)
         for data in (

@@ -39,7 +39,8 @@ class RetryPolicy:
         self.circuit_until = 0.0
 
     async def run(self, operation, *, timeout, provider, trace, context=None,
-                  cancellation=None, budget=None, started=None):
+                  cancellation=None, budget=None, started=None, request_timeout=None,
+                  reserve_in_operation=False):
         context = context or {}
         started = started or time.monotonic()
         deadline = started + timeout
@@ -66,7 +67,8 @@ class RetryPolicy:
                 remaining = min(remaining, budget.remaining_time())
             if remaining <= 0:
                 raise BudgetExceeded("Search request deadline reached.", category="time_budget")
-            search_id = budget.reserve_search() if budget else None
+            remaining = min(remaining, request_timeout or timeout)
+            search_id = budget.reserve_search() if budget and not reserve_in_operation else None
             meta = {"stage": "search", "provider": provider, **context,
                     "attempt": attempt + 1, "timeout_seconds": remaining}
             if search_id is not None:
@@ -85,6 +87,8 @@ class RetryPolicy:
                 raise
             except Exception as exc:
                 diagnostic = failure_from_exception(exc, provider=provider, stage="search", operation="search")
+                diagnostic = diagnostic.model_copy(update={"correlation_id": context.get("invocation_id"),
+                    "upstream_span_id": f"tool-{meta['search_id']}" if meta.get("search_id") is not None else None})
                 trace({"kind": "search_error", **meta, "diagnostic": diagnostic.model_dump(),
                        "duration_seconds": round(time.monotonic() - attempt_started, 3)})
                 retryable = diagnostic.category in TRANSIENT

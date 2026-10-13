@@ -1,22 +1,26 @@
 """Deterministic asynchronous research orchestration; models never own routing."""
 
 import asyncio
+from contextvars import copy_context
 import concurrent.futures
 import json
 import random
 import threading
 import time
+from pathlib import Path
+from uuid import uuid4
 from collections.abc import Callable
 
 from . import planner, researcher, writer
 from .budget import RunBudget, StageBackend, stage_prompt, token_bound
 from .cancellation import Cancellation, CancellableBackend, ResearchCancelled
 from .config import Config
-from .diagnostics import failure_from_exception
+from .capabilities import model_limits
+from .diagnostics import CALL_CONTEXT, failure_from_exception
 from .evidence_store import EvidenceStore, atomic_write
-from .judge import ResearchModelJudge, OpenAICompatibleJudge, evidence_snapshot, ready_eligible, validate_decision
+from .judge import ResearchModelJudge, OpenAICompatibleJudge, evidence_snapshot, ready_eligible, validate_decision, validate_quality
 from .llm import Backend, BudgetExceeded, IncompleteResponse, ResponseError
-from .models import EvidencePlan, JudgeDecision, PlannedQuery, ResearchState, Verification
+from .models import QualityEvaluation, JudgeDecision, PlannedQuery, ResearchState, Verification
 from .retrieval import TRANSIENT, retrieve
 from .sequential import ResearchAgent as SequentialResearchAgent
 from .tools.search import SearchRouter
@@ -36,7 +40,8 @@ async def blocking_call(operation, timeout, cancellation=None):
             if not future.cancelled():
                 future.set_exception(exc)
 
-    threading.Thread(target=work, daemon=True).start()
+    context = copy_context()
+    threading.Thread(target=lambda: context.run(work), daemon=True).start()
     wrapped = asyncio.wrap_future(future)
     deadline = time.monotonic() + timeout
     try:
@@ -53,6 +58,9 @@ async def blocking_call(operation, timeout, cancellation=None):
     finally:
         if not wrapped.done():
             wrapped.cancel()
+        elif not wrapped.cancelled():
+            # Cancellation may win after a worker has already failed.
+            wrapped.exception()
 
 
 class ResearchAgent:
@@ -70,6 +78,7 @@ class ResearchAgent:
         self.search.configure(config, self.budget)
         self.judge, self.fallback_judge = judge, fallback_judge
         self.owned_judges = []
+        self.writer_backend = None
         self.stage, self.provider = "initialize", "agent"
         self.search.cancellation, self.search.trace = self.cancellation, self.trace
         for provider in (search.web, search.documentation):
@@ -80,16 +89,73 @@ class ResearchAgent:
 
     def _stage(self, stage, provider=None):
         self.stage, self.provider = stage, provider or self.config.provider
-        self.trace({"kind": "stage_start", "stage": stage, "provider": self.provider})
-        self.progress({"plan": "Planning 15 research queries", "search": "Retrieving evidence concurrently",
+        task_id = uuid4().hex
+        CALL_CONTEXT.set({"parent_id": task_id, "stage": stage})
+        self.trace({"kind": "stage_start", "stage": stage, "provider": self.provider,
+                    "task_id": task_id, "parent_id": getattr(getattr(self, "_latest", None), "session_id", None)})
+        self.progress({"plan": "Planning research", "search": "Retrieving evidence concurrently",
                        "extract": "Extracting structured evidence", "verify": "Classifying evidence sufficiency",
                        "write": "Writing cited report", "validate": "Validating report citations"}.get(stage, stage))
 
-    def _backend(self, output, context, writing=False):
-        return StageBackend(self.backend, self.budget, output, context, writing=writing)
+    def _backend(self, output, context, writing=False, **options):
+        return StageBackend(self.writer_backend if writing and self.writer_backend else self.backend,
+                            self.budget, output, context, writing=writing, **options)
 
-    async def _model(self, operation, writing=False):
-        return await blocking_call(operation, min(self.config.request_timeout, self.budget.remaining_time(writing)), self.cancellation)
+    async def _model(self, operation, writing=False, backend=None):
+        timeout = backend.timeout if backend else self.config.request_timeout
+        try:
+            return await blocking_call(operation, min(timeout, self.budget.remaining_time(writing)), self.cancellation)
+        except BudgetExceeded as exc:
+            if backend and backend.partial_content:
+                if self.budget.checkpoint:
+                    self.budget.checkpoint("PartialStage", backend.partial_content, False)
+                raise IncompleteResponse(backend.partial_content, category=exc.category) from exc
+            raise
+
+    async def _plan(self, state, store):
+        backend = self._backend(min(self.config.planner_output_tokens, 4096), self.config.planner_input_tokens,
+                                reasoning_effort="low", max_continuations=0,
+                                timeout=min(30, self.config.request_timeout))
+        try:
+            brief = await self._model(lambda: planner.plan_evidence(backend, state.question), backend=backend)
+        except ResearchCancelled:
+            raise
+        except Exception as exc:
+            diagnostic = failure_from_exception(exc, provider=self.config.provider, stage="plan", operation="plan")
+            if diagnostic.category not in {"output_limit", "missing_finish", "timeout", "request_timeout",
+                                            "time_budget", "token_budget", "input_budget", "call_budget",
+                                            "cost_budget", "validation_error", "empty_response"}:
+                raise
+            brief = planner.recover_brief(state.question, getattr(exc, "partial_content", backend.partial_content))
+            recovery = "Continuing with a compact evidence plan recovered from available output or the question."
+            state.warnings.append(f"Planning limited ({diagnostic.category}): {diagnostic.message} {recovery}")
+            self.trace({"kind": "planning_recovered", "stage": "plan", "schema": "PlanningBrief",
+                        "diagnostic": diagnostic.model_dump(), "recovered": True, "recovery": recovery})
+        # Persist a usable plan before making another provider request.
+        state.plan = planner.assemble_plan(brief, [], min(15, self.config.max_searches))
+        store.persist()
+        self.trace({"kind": "plan", **state.plan.model_dump(), "query_count": 0})
+        backend = self._backend(min(self.config.planner_output_tokens, 4096), self.config.planner_input_tokens,
+                                thinking_enabled=False, max_continuations=0,
+                                timeout=min(30, self.config.request_timeout))
+        try:
+            batch = await self._model(lambda: planner.generate_queries(backend, state.question, brief,
+                                     min(15, self.config.max_searches)), backend=backend)
+            queries = batch.queries
+        except ResearchCancelled:
+            raise
+        except Exception as exc:
+            diagnostic = failure_from_exception(exc, provider=self.config.provider, stage="plan", operation="queries")
+            if diagnostic.category in {"authentication", "permission", "invalid_request"}:
+                raise
+            queries = planner.recover_queries(getattr(exc, "partial_content", backend.partial_content))
+            recovery = "Using available queries and generating missing searches from plan requirements."
+            state.warnings.append(f"Query generation limited ({diagnostic.category}): {diagnostic.message} {recovery}")
+            self.trace({"kind": "planning_recovered", "stage": "plan", "schema": "QueryBatch",
+                        "diagnostic": diagnostic.model_dump(), "recovered": True, "recovery": recovery})
+        state.plan = planner.assemble_plan(brief, queries, min(15, self.config.max_searches))
+        self.trace({"kind": "plan", **state.plan.model_dump(), "query_count": len(state.plan.search_queries)})
+        store.persist()
 
     def _usage(self, state):
         state.api_calls, state.search_calls = self.budget.calls, self.budget.searches
@@ -111,48 +177,49 @@ class ResearchAgent:
             if event.get("kind") == "search_start" and event["query"] not in state.executed_queries:
                 state.executed_queries.append(event["query"])
             self.trace({"round": state.rounds, "source": "web", **event})
-        results = await retrieve(queries, self.search, self.budget, retrieval_trace)
         usable = {}
-        terminal_error = None
-        for query, result in zip(queries, results):
-            if isinstance(result, ResearchCancelled):
-                raise result
+        terminal_errors = []
+        ready = {qid: asyncio.Event() for group in groups for qid in group}
+
+        def accept_result(query, result):
+            # The event-loop owner persists evidence before releasing dependants.
             if isinstance(result, BaseException):
-                terminal_error = result
-                continue
-            if result.failure:
-                state.warnings.append(f"Source coverage incomplete for {query.id}: search unavailable ({result.failure.category}); continuing with available evidence.")
-                continue
-            store.add_result(query, result)
-            usable[query.id] = result
-        self._usage(state)
-        store.persist()
-        if not any(result.sources or result.documents for result in usable.values()):
-            state.round_history.append({"round": state.rounds, "query_ids": [q.id for q in queries],
-                                        "queries": [q.query for q in queries], "new_findings": 0,
-                                        "source_count": len(state.sources), "evidence_version": state.evidence_version})
+                terminal_errors.append(result)
+                diagnostic = failure_from_exception(result, provider="tavily", stage="search", operation="search")
+                state.warnings.append(f"Search {query.id} limited ({diagnostic.category}): {diagnostic.message} Continuing with available evidence.")
+                self.trace({"kind": "retrieval_error", "query_id": query.id, "diagnostic": diagnostic.model_dump()})
+            elif result.failure:
+                state.warnings.append(f"Source coverage incomplete for {query.id}: {result.failure.message} Continuing with available evidence.")
+            else:
+                store.add_result(query, result)
+                usable[query.id] = result
+            self._usage(state)
             store.persist()
-            if terminal_error is not None:
-                raise terminal_error
-            return 0
-        state.status = "EXTRACTING"
-        self._stage("extract")
+            if query.id in ready:
+                ready[query.id].set()
 
         async def extract(group):
+            await asyncio.gather(*(ready[qid].wait() for qid in group if qid in ready))
+            self.cancellation.check()
             assigned = [q for q in queries if q.id in group]
             result_list = [usable[q.id] for q in assigned if q.id in usable]
+            if not any(result.documents for result in result_list):
+                return None
             ids = {rid for q in assigned for rid in q.requirement_ids}
             requirements = [r for r in state.plan.research_requirements if r.id in ids]
             payload = researcher.group_payload(state.question, requirements, assigned, result_list,
                                                self.config.researcher_input_tokens, state.findings)
             if not assigned or not result_list:
                 return None
-            backend = self._backend(self.config.researcher_output_tokens, self.config.researcher_input_tokens)
+            state.status = "EXTRACTING"
+            self._stage("extract")
+            backend = self._backend(self.config.researcher_output_tokens, self.config.researcher_input_tokens,
+                                    max_continuations=0)
             self.trace({"kind": "researcher_start", "stage": "extract", "query_ids": group,
                         "input_bytes": token_bound(json.dumps(payload, ensure_ascii=False)),
                         "max_output_tokens": self.config.researcher_output_tokens})
             try:
-                output = await self._model(lambda: researcher.extract_group(backend, payload))
+                output = await self._model(lambda: researcher.extract_group(backend, payload), backend=backend)
             except IncompleteResponse as exc:
                 partial = researcher.partial_extraction(exc.partial_content)
                 if partial is not None:
@@ -166,7 +233,18 @@ class ResearchAgent:
                 return await extract(group)
             except Exception as exc:
                 return exc
-        workers = [asyncio.create_task(guarded_extract(group)) for group in groups]
+        async def retrieval_worker():
+            try:
+                await retrieve(queries, self.search, self.budget, retrieval_trace, accept_result)
+                if any(isinstance(error, ResearchCancelled) for error in terminal_errors):
+                    raise ResearchCancelled("Research stopped by the user.")
+                return None
+            finally:
+                for event in ready.values():
+                    event.set()
+
+        workers = [asyncio.create_task(retrieval_worker())]
+        workers += [asyncio.create_task(guarded_extract(group)) for group in groups]
         try:
             for completed in asyncio.as_completed(workers):
                 output = await completed
@@ -174,10 +252,9 @@ class ResearchAgent:
                     raise output
                 if isinstance(output, BaseException):
                     diagnostic = failure_from_exception(output, provider=self.config.provider, stage="extract", operation="extract")
-                    state.warnings.append(f"Researcher unavailable: {diagnostic.category}.")
+                    state.warnings.append(f"Researcher unavailable ({diagnostic.category}): {diagnostic.message}")
                     self.trace({"kind": "researcher_error", "diagnostic": diagnostic.model_dump()})
-                    if isinstance(output, BudgetExceeded):
-                        terminal_error = output
+                    # A worker's limit must not prevent its siblings or the classifier from finishing.
                     checkpoint = getattr(output, "extraction_checkpoint", None)
                     if checkpoint is not None:
                         store.merge(*checkpoint)
@@ -195,14 +272,14 @@ class ResearchAgent:
                 if not worker.done():
                     worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+        if not usable and terminal_errors:
+            raise terminal_errors[0]
         gain = len(evidence_keys() - before)
         state.round_history.append({"round": state.rounds, "query_ids": [q.id for q in queries],
                                     "queries": [q.query for q in queries], "new_findings": gain,
                                     "source_count": len(state.sources), "evidence_version": state.evidence_version})
         self._usage(state)
         store.persist()
-        if terminal_error is not None:
-            raise terminal_error
         return gain
 
     def _get_judge(self, fallback=False):
@@ -220,6 +297,7 @@ class ResearchAgent:
         self._stage("verify", self.config.provider if self.config.judge_provider == "research" else self.config.judge_provider)
         state.status = "CLASSIFYING"
         requirements = state.plan.research_requirements
+        invocation = f"evidence-{uuid4().hex}"
         for fallback in (False, True):
             if fallback and not (self.fallback_judge or self.config.judge_fallback_provider):
                 break
@@ -254,7 +332,8 @@ class ResearchAgent:
                     judge.timeout = min(self.config.judge_timeout, self.budget.remaining_time())
                     judge.output_tokens = self.config.judge_output_tokens
                     judge.usage = {"usage_observed": False}
-                    metadata = {"call_id": f"judge-{self.budget.calls}", "schema": "JudgeDecision", "stage": "verify",
+                    judge.request_id = None
+                    metadata = {"call_id": f"judge-{self.budget.calls}", "invocation_id": invocation, "attempt": attempt + 1, "parent_id": CALL_CONTEXT.get().get("parent_id"), "schema": "JudgeDecision", "stage": "verify",
                                 "provider": judge.provider, "model": judge.model, "timeout_seconds": judge.timeout,
                                 "max_output_tokens": judge.output_tokens,
                                 "pricing": {"model": judge.model, "input_price_per_million": rates[0], "output_price_per_million": rates[1]}}
@@ -262,7 +341,7 @@ class ResearchAgent:
                         self.trace({"kind": "llm_start", **metadata})
                     self.trace({"kind": "classifier_start", "stage": "verify", "provider": judge.provider,
                                 "model": judge.model, "attempt": attempt, "evidence_version": state.evidence_version})
-                    result = await blocking_call(lambda: judge.evaluate(state.question, requirements, snapshot, research_context),
+                    result = await blocking_call(lambda judge=judge, snapshot=snapshot, research_context=research_context: judge.evaluate(state.question, requirements, snapshot, research_context),
                                                  judge.timeout, self.cancellation)
                     # Validate against the exact bounded snapshot, not hidden claims the judge never received.
                     visible = {f["id"] for f in snapshot["findings"]}
@@ -285,16 +364,18 @@ class ResearchAgent:
                                 "coverage_score": result.coverage_score, "evidence_score": result.evidence_score,
                                 "reliability_score": result.reliability_score})
                     succeeded = True
+                    if attempt:
+                        self.trace({"kind": "llm_recovered", **metadata, "recovered": True})
                     return result
                 except ResearchCancelled:
                     raise
                 except Exception as exc:
                     diagnostic = failure_from_exception(exc, provider=judge.provider, stage="verify", operation="classify")
                     self.trace({"kind": "classifier_error", "stage": "verify", "provider": judge.provider,
-                                "model": judge.model, "attempt": attempt, "diagnostic": diagnostic.model_dump()})
+                                "model": judge.model, "attempt": attempt + 1, "invocation_id": invocation, "diagnostic": diagnostic.model_dump()})
                     if isinstance(exc, BudgetExceeded):
                         raise
-                    recoverable = diagnostic.category in TRANSIENT | {"validation_error", "empty_response", "output_limit", "invalid_response", "evidence_reference"}
+                    recoverable = diagnostic.category in (TRANSIENT - {"timeout", "request_timeout"}) | {"validation_error", "empty_response", "invalid_response", "evidence_reference"}
                     if not recoverable:
                         break
                 finally:
@@ -305,14 +386,15 @@ class ResearchAgent:
                             self.trace({"kind": "llm_complete" if succeeded else "llm_error", **metadata, **usage,
                                         "duration_seconds": round(time.monotonic() - attempt_started, 3),
                                         "finish_reason": "stop" if succeeded else None,
-                                        "diagnostic": diagnostic.model_dump() if diagnostic else None})
+                                        "diagnostic": diagnostic.model_dump() if diagnostic else None,
+                                        "request_id": (diagnostic.request_id if diagnostic else getattr(judge, "request_id", None))})
                 if diagnostic is not None and attempt + 1 < attempts:
                     base_delay = min(self.config.llm_max_delay, self.config.llm_backoff * 2 ** attempt)
                     delay = min(self.config.llm_max_delay, base_delay + random.uniform(0, base_delay * self.config.llm_jitter))
                     delay = max(delay, diagnostic.retry_after_seconds or 0)
                     if delay >= self.budget.remaining_time():
                         raise BudgetExceeded("Classifier retry deadline reached.", category="time_budget")
-                    self.trace({"kind": "llm_retry", "stage": "verify", "provider": judge.provider,
+                    self.trace({"kind": "llm_retry", "invocation_id": invocation, "stage": "verify", "provider": judge.provider,
                                 "category": diagnostic.category, "retry_delay_seconds": delay, "next_attempt": attempt + 2})
                     await cancellable_wait(asyncio.sleep(delay), self.cancellation)
         state.warnings.append("Evidence classification was unavailable; this is a qualified best-effort answer.")
@@ -325,35 +407,247 @@ class ResearchAgent:
             supported_finding_ids=supported, conflicts=state.judge.contradictions if state.judge else state.contradictions,
             gaps=state.judge.critical_gaps if state.judge else ["Classification unavailable."], follow_up_tasks=[])
 
-    async def _write(self, state):
-        self._stage("write")
+    async def _write(self, state, previous_draft=None, feedback=None):
+        previous_report_status, previous_citation_status = state.report_status, state.citation_validation_status
+        self._stage("write", self.config.final_writer_provider)
         state.status = "WRITING"
         self._verification(state)
         draft = None
+        synthesis_started = time.monotonic()
+        interrupted = False
+        last_preview = 0.0
+        self._partial_report = None
+        loop = asyncio.get_running_loop()
+        preview_open = True
+
+        def publish_preview(content):
+            nonlocal last_preview
+            if not preview_open or self.cancellation.event.is_set():
+                return
+            now = time.monotonic()
+            if now - last_preview < 0.5:
+                return
+            last_preview = now
+            partial = writer.partial_draft(state, content, fill_missing=False)
+            if partial:
+                self._partial_report = partial
+                snapshot = state.model_copy(update={"report_status": "incomplete"})
+                rendered = writer.render(snapshot, partial)
+                atomic_write(Path(state.facts_path).parent / "report.partial.md", rendered)
+                self.trace({"kind": "report_preview", "stage": "write", "report": rendered,
+                            "incomplete": True, "citation_validation_status": "references_only"})
+
+        def preview(content):
+            # Provider callbacks run on worker threads. Publish only on the
+            # controller loop, while this synthesis call still owns the report.
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(publish_preview, content)
+
         try:
+            model = self.config.final_writer_model
+            if model and (model != self.config.model or self.config.final_writer_provider != self.config.provider) and self.writer_backend is None:
+                factory = getattr(self.backend, "for_model", None)
+                if factory is None:
+                    raise ValueError("The injected backend does not support model selection")
+                self.writer_backend = factory(model, provider=self.config.final_writer_provider)
             if state.verification.supported_finding_ids:
-                backend = self._backend(self.config.writer_output_tokens, self.config.writer_input_tokens, writing=True)
-                draft = await self._model(lambda: writer.write_evidence(backend, state, self.config.writer_input_tokens), writing=True)
+                writer_config = getattr(self.writer_backend or self.backend, "config", self.config)
+                context_limit, output_limit = model_limits(writer_config)
+                input_limit = min(self.config.writer_input_tokens, context_limit - min(self.config.writer_output_tokens, output_limit) - 128)
+                backend = self._backend(self.config.writer_output_tokens, input_limit,
+                                        writing=True, max_continuations=0, on_partial=preview)
+                try:
+                    draft = await self._model(lambda: writer.write_evidence(backend, state, input_limit, previous_draft, feedback),
+                                              writing=True, backend=backend)
+                except IncompleteResponse as exc:
+                    interrupted = True
+                    draft = writer.partial_draft(state, exc.partial_content)
+                    if draft is None:
+                        raise
+                    state.warnings.append("Report generation was interrupted; retained complete paragraphs and stored evidence.")
+                finally:
+                    preview_open = False
                 self._stage("validate")
-                audit_backend = self._backend(self.config.audit_output_tokens, self.config.writer_input_tokens, writing=True)
-                await self._model(lambda: writer.audit_report(audit_backend, state, draft), writing=True)
+                audit_backend = self._backend(min(self.config.audit_output_tokens, 4096), self.config.writer_input_tokens,
+                                              writing=True, thinking_enabled=False, max_continuations=0,
+                                              timeout=min(20, self.config.request_timeout))
+                await self._model(lambda: writer.audit_report(audit_backend, state, draft), writing=True, backend=audit_backend)
                 state.citation_validation_status = "semantic_and_references_passed"
-                state.report_status = "generated"
+                state.report_status = "incomplete" if interrupted else "generated"
             else:
                 state.warnings.append("No eligible source-backed evidence was collected.")
         except ResearchCancelled:
             raise
         except Exception as exc:
-            diagnostic = failure_from_exception(exc, provider=self.config.provider, stage=self.stage, operation="write_or_validate")
+            diagnostic = failure_from_exception(exc, provider=self.provider, stage=self.stage, operation="write_or_validate")
             self.trace({"kind": "report_error", "diagnostic": diagnostic.model_dump()})
-            state.warnings.append(f"Final generation unavailable ({diagnostic.category}); report assembled from stored evidence.")
-            draft = None
+            state.warnings.append(f"Final generation unavailable ({diagnostic.category}): {diagnostic.message} Report assembled from stored evidence.")
+            draft = previous_draft
+            if draft is not None:
+                state.report_status, state.citation_validation_status = previous_report_status, previous_citation_status
+        finally:
+            preview_open = False
         if draft is None:
             draft = writer.evidence_draft(state)
             if any(s.paragraphs for s in draft.sections):
                 writer.validate_draft(state, draft)
             state.citation_validation_status = "extractive_references_passed"
             state.report_status = "best_effort_assembled"
+        self.trace({"kind": "synthesis_complete", "stage": "write",
+                    "model": self.config.final_writer_model or self.config.model,
+                    "duration_seconds": round(time.monotonic() - synthesis_started, 3),
+                    "report_status": state.report_status})
+        return draft
+
+    async def _assess_answer(self, state, draft, store):
+        """Evaluate the actual rendered answer; API failure leaves quality unverified."""
+        self._stage("validate", self.config.judge_provider)
+        requirements = state.plan.research_requirements
+        answer = writer.render(state, draft)
+        context = {"status": state.status, "stop_reason": state.stop_reason,
+                   "report_status": state.report_status, "citation_validation_status": state.citation_validation_status,
+                   "remaining_budget": self.budget.snapshot(), "unresolved_questions": state.unresolved,
+                   "contradictions": state.contradictions,
+                   "thresholds": {"primary": self.config.quality_min_primary_score,
+                                  "grounding": self.config.quality_min_grounding_score,
+                                  "overall": self.config.quality_min_overall_score}}
+        invocation = f"quality-{uuid4().hex}"
+        for fallback in (False, True):
+            if fallback and not (self.fallback_judge or self.config.judge_fallback_provider):
+                break
+            for attempt in range(self.config.judge_retries + 1):
+                reservation = None
+                metadata = None
+                diagnostic = None
+                started = time.monotonic()
+                judge = None
+                try:
+                    judge = self._get_judge(fallback)
+                    prompt = getattr(judge, "answer_prompt", "Evaluate answer relevance, requirements and factual grounding.")
+                    base = {"original_query": state.question, "requirements": [r.model_dump() for r in requirements],
+                            "final_answer": answer, "evidence": {}, "research_completion": context}
+                    overhead = token_bound(stage_prompt(prompt, QualityEvaluation)) + token_bound(json.dumps(base, ensure_ascii=False)) + 128
+                    snapshot = evidence_snapshot(state, max(0, self.config.judge_input_tokens - overhead))
+                    payload = {**base, "evidence": snapshot}
+                    managed = getattr(judge, "budget_managed", False)
+                    rates = getattr(judge, "rates", (self.config.judge_input_price_per_million, self.config.judge_output_price_per_million))
+                    if not managed:
+                        reservation = self.budget.reserve_model(overhead + token_bound(json.dumps(snapshot, ensure_ascii=False)),
+                                                               self.config.judge_output_tokens, rates, writing=True)
+                    judge.timeout = min(self.config.judge_timeout, self.budget.remaining_time(writing=True))
+                    judge.output_tokens = self.config.judge_output_tokens
+                    judge.usage = {"usage_observed": False}
+                    judge.request_id = None
+                    metadata = {"call_id": f"quality-call-{uuid4().hex}", "invocation_id": invocation, "attempt": attempt + 1,
+                                "schema": "QualityEvaluation", "stage": "validate", "operation": "evaluate_answer",
+                                "provider": judge.provider, "model": judge.model, "parent_id": state.session_id,
+                                "timeout_seconds": judge.timeout, "max_output_tokens": judge.output_tokens,
+                                "pricing": {"model": judge.model, "input_price_per_million": rates[0], "output_price_per_million": rates[1]}}
+                    if not managed:
+                        self.trace({"kind": "llm_start", **metadata})
+                    result = await blocking_call(lambda judge=judge, snapshot=snapshot: judge.evaluate_answer(state.question, requirements, answer, snapshot, context),
+                                                 judge.timeout, self.cancellation)
+                    advisory = result.model_dump() if isinstance(result, QualityEvaluation) else result
+                    hard_issues = []
+                    try:
+                        writer.validate_draft(state, draft)
+                    except ResponseError:
+                        hard_issues.append("The answer failed deterministic evidence-reference validation.")
+                    if state.report_status != "generated":
+                        hard_issues.append("The answer is incomplete or assembled from evidence without completed synthesis.")
+                    cited = {fid for section in draft.sections for paragraph in section.paragraphs for fid in paragraph.finding_ids}
+                    result = validate_quality(result, requirements, snapshot, self.config,
+                                              answer_claim_ids=cited, hard_issues=hard_issues)
+                    state.quality_evaluation = result
+                    state.quality_status = result.decision.lower()
+                    store.save_quality_evaluation(payload, result, judge.provider, judge.model, advisory)
+                    self.trace({"kind": "quality_evaluation", **metadata, "decision": result.decision,
+                                "scores": result.scores.model_dump(), "overall_score": result.overall_score,
+                                "rejection_reasons": result.critical_issues, "confidence": result.confidence,
+                                "duration_seconds": round(time.monotonic() - started, 3)})
+                    if attempt:
+                        self.trace({"kind": "llm_recovered", **metadata, "recovered": True,
+                                    "recovery": "A subsequent structured evaluation succeeded."})
+                    return result
+                except ResearchCancelled:
+                    raise
+                except Exception as exc:
+                    state.quality_status = "unverified"
+                    diagnostic = failure_from_exception(exc, provider=judge.provider if judge else self.config.judge_provider,
+                                                        stage="validate", operation="evaluate_answer")
+                    self.trace({"kind": "quality_error", **(metadata or {"invocation_id": invocation}),
+                                "diagnostic": diagnostic.model_dump()})
+                    if isinstance(exc, BudgetExceeded):
+                        break
+                    if diagnostic.category not in TRANSIENT | {"validation_error", "invalid_response", "empty_response", "evidence_reference"}:
+                        break
+                    if attempt < self.config.judge_retries:
+                        delay = max(self.config.llm_backoff, diagnostic.retry_after_seconds or 0)
+                        if delay >= self.budget.remaining_time(writing=True):
+                            break
+                        self.trace({"kind": "llm_retry", **(metadata or {}), "invocation_id": invocation,
+                                    "next_attempt": attempt + 2, "retry_delay_seconds": delay,
+                                    "recovery": "Retrying the structured evaluation within the configured limit."})
+                        await cancellable_wait(asyncio.sleep(delay), self.cancellation)
+                finally:
+                    if reservation is not None:
+                        usage = getattr(judge, "usage", {"usage_observed": False})
+                        self.budget.settle(reservation, usage)
+                        self.trace({"kind": "llm_error" if diagnostic else "llm_complete", **metadata, **usage,
+                                    "duration_seconds": round(time.monotonic() - started, 3),
+                                    "diagnostic": diagnostic.model_dump() if diagnostic else None,
+                                        "request_id": (diagnostic.request_id if diagnostic else getattr(judge, "request_id", None))})
+        state.research_limitations.append("The final answer's relevance and completeness could not be independently verified.")
+        return None
+
+    async def _quality_loop(self, state, draft, store):
+        if not any(section.paragraphs for section in draft.sections):
+            state.quality_status = "insufficient_evidence"
+            state.research_limitations.append("No source-backed evidence is available to answer the request reliably.")
+            self.trace({"kind": "quality_rejected", "stage": "validate", "decision": "INSUFFICIENT_EVIDENCE",
+                        "rejection_reasons": ["The answer contains no evidence-backed paragraphs."]})
+            return draft
+        for iteration in range(self.config.quality_max_iterations + 1):
+            result = await self._assess_answer(state, draft, store)
+            store.persist()
+            if result is None or result.decision == "PASS":
+                return draft
+            if result.decision == "INSUFFICIENT_EVIDENCE":
+                for rid in result.missing_requirements:
+                    requirement = next(r for r in state.plan.research_requirements if r.id == rid)
+                    state.research_limitations.append(f"Insufficient evidence to answer: {requirement.question}")
+                state.research_limitations.extend(result.unsupported_claims)
+                if not result.missing_requirements and not result.unsupported_claims:
+                    state.research_limitations.append("Available evidence does not support a reliable answer to all requested questions.")
+                if result.unsupported_claims or result.citation_issues:
+                    draft = writer.evidence_draft(state)
+                    state.report_status = "best_effort_assembled"
+                    state.citation_validation_status = "extractive_references_passed"
+                return draft
+            if iteration >= self.config.quality_max_iterations:
+                state.quality_status = "iteration_limit"
+                state.research_limitations.append("The answer requires further review to fully satisfy the request.")
+                return draft
+            if result.decision == "MORE_RESEARCH":
+                seen = {" ".join(q.casefold().split()) for q in state.executed_queries}
+                queries = []
+                for query in result.suggested_queries:
+                    normalized = " ".join(query.query.casefold().split())
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        queries.append(PlannedQuery(id=f"quality-{iteration}-{len(queries)}", **query.model_dump()))
+                if not queries:
+                    state.quality_status = "insufficient_evidence"
+                    state.research_limitations.extend(f"No additional evidence for: {r.question}" for r in state.plan.research_requirements if r.id in result.missing_requirements)
+                    return draft
+                gain = await self._round(state, store, queries, [[q.id for q in queries]])
+                if gain < self.config.min_information_gain:
+                    state.quality_status = "insufficient_evidence"
+                    state.research_limitations.extend(f"Missing evidence for: {r.question}" for r in state.plan.research_requirements if r.id in result.missing_requirements)
+                    return draft
+                # Reassess evidence from the preserved store, never repeat the initial plan.
+                await self._evaluate(state, store)
+            draft = await self._write(state, previous_draft=draft, feedback=result.model_dump())
         return draft
 
     async def arun(self, question):
@@ -363,7 +657,7 @@ class ResearchAgent:
         self._latest = state
         store = EvidenceStore(state, self.config.session_dir)
         def checkpoint(schema, content, complete):
-            atomic_write(store.directory / f"generation-{threading.get_ident()}-{schema}.json",
+            atomic_write(store.directory / f"generation-{uuid4().hex}-{schema}.json",
                          json.dumps({"schema": schema, "content": content, "complete": complete,
                                      "session_id": state.session_id, "evidence_version": state.evidence_version}, ensure_ascii=False))
         self.budget.checkpoint = checkpoint
@@ -372,10 +666,7 @@ class ResearchAgent:
         try:
             self._stage("plan")
             state.status = "PLANNING"
-            state.plan = await self._model(lambda: planner.plan_evidence(self._backend(self.config.planner_output_tokens, self.config.planner_input_tokens), state.question))
-            state.plan = EvidencePlan.model_validate(state.plan.model_dump())
-            self.trace({"kind": "plan", **state.plan.model_dump(), "query_count": 15})
-            store.persist()
+            await self._plan(state, store)
             queries = state.plan.search_queries
             groups = [g.query_ids for g in state.plan.research_groups]
             for round_index in range(self.config.max_rounds + 1):
@@ -408,7 +699,7 @@ class ResearchAgent:
                         continue
                     seen.add(normalized)
                     # Every follow-up is explicitly attached to unresolved critical requirements.
-                    queries.append(PlannedQuery(id=f"Q{15 + round_index * 5 + len(queries) + 1}", query=text.strip(), requirement_ids=missing))
+                    queries.append(PlannedQuery(id=f"Q{len(state.plan.search_queries) + round_index * 5 + len(queries) + 1}", query=text.strip(), requirement_ids=missing))
                     if len(queries) >= min(5, self.config.max_tasks):
                         break
                 if not queries:
@@ -423,24 +714,39 @@ class ResearchAgent:
         except Exception as exc:
             state.stop_reason = "budget" if isinstance(exc, BudgetExceeded) else "error"
             diagnostic = failure_from_exception(exc, provider=self.provider, stage=self.stage, operation=self.stage)
-            state.warnings.append(f"Research terminated at {diagnostic.stage}: {diagnostic.category}.")
+            state.warnings.append(f"Research limited at {diagnostic.stage} ({diagnostic.category}): {diagnostic.message} Finishing with collected evidence.")
             self.trace({"kind": "research_error", "diagnostic": diagnostic.model_dump()})
             if not isinstance(exc, BudgetExceeded):
                 state.failure = diagnostic
         try:
             if state.stop_reason != "cancelled":
                 draft = await self._write(state)
+                draft = await self._quality_loop(state, draft, store)
         except (ResearchCancelled, asyncio.CancelledError):
             self.cancellation.cancel()
             state.stop_reason = "cancelled"
-            draft = None
+            draft = getattr(self, "_partial_report", None)
+            if draft is not None:
+                state.report_status = "incomplete"
+        except Exception as exc:
+            state.quality_status = "unverified"
+            state.research_limitations.append("Some requested information could not be independently verified.")
+            self.trace({"kind": "quality_error", "diagnostic": failure_from_exception(
+                exc, provider=self.provider, stage=self.stage, operation="quality_recovery").model_dump()})
         finally:
             self._usage(state)
             complete = (state.stop_reason == "coverage" and state.report_status == "generated"
-                        and not state.failure and not state.warnings)
+                        and state.quality_status == "pass" and not state.failure and not state.research_limitations
+                        and not state.unresolved and not state.contradictions)
             state.status = ("CANCELLED" if state.stop_reason == "cancelled" else "COMPLETE" if complete
                             else "PARTIAL" if state.findings else "FAILED")
             store.persist()
+            if self.writer_backend is not None:
+                try:
+                    self.writer_backend.close_stream()
+                    self.writer_backend.client.close()
+                except Exception:
+                    pass
             for judge in self.owned_judges:
                 try:
                     judge.close()

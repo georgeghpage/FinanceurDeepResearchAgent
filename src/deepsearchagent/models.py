@@ -28,27 +28,52 @@ class PlannedQuery(Contract):
 class ResearchGroup(Contract):
     id: str
     theme: str
-    query_ids: list[str] = Field(min_length=5, max_length=5)
+    query_ids: list[str] = Field(min_length=1, max_length=5)
+
+
+class PlanningBrief(Contract):
+    objective: str = Field(min_length=1, max_length=500)
+    steps: list[str] = Field(min_length=1, max_length=5)
+    research_requirements: list[Requirement] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def concise_plan(self):
+        if any(not s.strip() or len(s) > 300 for s in self.steps):
+            raise ValueError("Plan steps must be short, concrete sentences")
+        if len({r.id for r in self.research_requirements}) != len(self.research_requirements):
+            raise ValueError("Requirement identifiers must be unique")
+        return self
+
+
+class QuerySpec(Contract):
+    query: str = Field(min_length=1, max_length=500)
+    requirement_ids: list[str] = Field(min_length=1)
+
+
+class QueryBatch(Contract):
+    queries: list[QuerySpec] = Field(min_length=1, max_length=15)
 
 
 class EvidencePlan(Contract):
+    objective: str = ""
+    steps: list[str] = Field(default_factory=list)
     research_requirements: list[Requirement] = Field(min_length=1, max_length=20)
-    research_groups: list[ResearchGroup] = Field(min_length=3, max_length=3)
-    search_queries: list[PlannedQuery] = Field(min_length=15, max_length=15)
+    research_groups: list[ResearchGroup] = Field(min_length=1, max_length=3)
+    search_queries: list[PlannedQuery] = Field(min_length=1, max_length=15)
     requirement_query_mapping: dict[str, list[str]]
 
     @model_validator(mode="after")
     def validate_mapping(self):
         requirements = {r.id for r in self.research_requirements}
         queries = {q.id for q in self.search_queries}
-        if len(requirements) != len(self.research_requirements) or len(queries) != 15:
+        if len(requirements) != len(self.research_requirements) or len(queries) != len(self.search_queries):
             raise ValueError("Plan identifiers must be unique")
-        if len({g.id for g in self.research_groups}) != 3:
+        if len({g.id for g in self.research_groups}) != len(self.research_groups):
             raise ValueError("Group identifiers must be unique")
         grouped = [qid for g in self.research_groups for qid in g.query_ids]
-        if len(set(grouped)) != 15 or set(grouped) != queries:
+        if len(grouped) != len(queries) or set(grouped) != queries:
             raise ValueError("Each query must belong to exactly one group")
-        if len({" ".join(q.query.casefold().split()) for q in self.search_queries}) != 15:
+        if len({" ".join(q.query.casefold().split()) for q in self.search_queries}) != len(queries):
             raise ValueError("Search queries must be distinct")
         if any(not q.query.strip() or not set(q.requirement_ids) <= requirements for q in self.search_queries):
             raise ValueError("Queries must reference known requirements")
@@ -105,6 +130,49 @@ class JudgeDecision(Contract):
         if any(not v.strip() or len(v) > 500 or any(ord(c) < 32 for c in v) for v in values):
             raise ValueError("Invalid suggested query")
         return values
+
+
+class QualityScores(Contract):
+    relevance: float = Field(ge=0, le=5, allow_inf_nan=False)
+    requirement_coverage: float = Field(ge=0, le=5, allow_inf_nan=False)
+    factual_grounding: float = Field(ge=0, le=5, allow_inf_nan=False)
+    citation_quality: float = Field(ge=0, le=5, allow_inf_nan=False)
+    analytical_quality: float = Field(ge=0, le=5, allow_inf_nan=False)
+    uncertainty_handling: float = Field(ge=0, le=5, allow_inf_nan=False)
+
+
+class AnswerRequirement(Contract):
+    requirement_id: str
+    status: Literal["COVERED", "PARTIAL", "MISSING", "CONFLICTED"]
+    assessment: str = Field(min_length=1, max_length=2000)
+    supporting_claim_ids: list[str]
+    supporting_source_ids: list[str]
+
+
+class QualityEvaluation(Contract):
+    decision: Literal["PASS", "REVISE", "MORE_RESEARCH", "INSUFFICIENT_EVIDENCE"]
+    scores: QualityScores
+    overall_score: float = Field(ge=0, le=5, allow_inf_nan=False)
+    requirements_coverage: list[AnswerRequirement]
+    missing_requirements: list[str]
+    unsupported_claims: list[str]
+    citation_issues: list[str]
+    irrelevant_content: list[str]
+    critical_issues: list[str]
+    actionable_feedback: list[str]
+    recommended_next_action: str = Field(min_length=1, max_length=3000)
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    suggested_queries: list[QuerySpec] = Field(max_length=5)
+
+    @model_validator(mode="after")
+    def actionable_decision(self):
+        if self.decision == "MORE_RESEARCH" and (not self.missing_requirements or not self.suggested_queries):
+            raise ValueError("MORE_RESEARCH needs missing requirements and targeted queries")
+        if self.decision != "MORE_RESEARCH" and self.suggested_queries:
+            raise ValueError("Queries require MORE_RESEARCH")
+        if self.decision != "PASS" and not self.actionable_feedback:
+            raise ValueError("A rejected answer requires actionable feedback")
+        return self
 
 
 class ResearchTask(BaseModel):
@@ -207,7 +275,14 @@ class FailureDiagnostic(BaseModel):
     retry_after_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     request_id: str | None = None
     finish_reason: str | None = None
-    call_id: int | None = None
+    call_id: int | str | None = None
+    correlation_id: str | None = None
+    upstream_span_id: str | None = None
+    origin: Literal["call", "downstream"] = "call"
+    downstream_effects: list[str] = Field(default_factory=list)
+    provider_code: str | None = None
+    root_cause: str = "Unknown"
+    cause_confidence: Literal["confirmed", "suspected", "unknown"] = "unknown"
 
 
 class ResearchState(BaseModel):
@@ -218,6 +293,10 @@ class ResearchState(BaseModel):
     status: str = "INITIALIZED"
     plan: EvidencePlan | ResearchPlan | None = None
     judge: JudgeDecision | None = None
+    quality_evaluation: QualityEvaluation | None = None
+    quality_history: list[dict] = Field(default_factory=list)
+    quality_status: str = "pending"
+    research_limitations: list[str] = Field(default_factory=list)
     evidence_version: int = 0
     contradictions: list[str] = Field(default_factory=list)
     unresolved: list[str] = Field(default_factory=list)

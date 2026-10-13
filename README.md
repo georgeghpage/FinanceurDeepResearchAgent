@@ -1,27 +1,57 @@
 # Deep Research Agent
 
 A bounded asynchronous research system using **DeepSeek V4.1 Flash through
-Alibaba Cloud Model Studio** for planning, parallel extraction, evidence evaluation,
-report writing and validation. Thinking is enabled with `reasoning_effort="max"`.
+Alibaba Cloud Model Studio** for planning and parallel extraction, **Qwen3.8 Flash**
+for final writing, and **Qwen3.8 Max** for evidence and final-answer evaluation. Analysis defaults to `reasoning_effort="low"`;
+query generation disables thinking on supported models (otherwise uses low effort).
 Existing Tavily MCP transport, evidence store, cancellation, tracing, local UI,
 and PostgreSQL history remain in use. Provider choice remains configurable.
 
 ```text
 Question → isolated session/research_facts.md
-         → Planner: 15 queries, 3 groups of 5
+         → Planner: concise objective, 2–5 steps, essential evidence requirements
+         → Query generator: queries only, no thinking, up to 15 searches
          → bounded asynchronous Tavily retrieval
-         → 3 parallel Research Subagents (16,384 initial output tokens each)
+         → up to 3 parallel evidence extractors (16,384 output tokens each)
          → serialized evidence consolidation + atomic snapshots
          → Evidence Sufficiency Judge
              READY                 → Structural Agent
              RESEARCH_MORE         → ≤5 targeted searches → extractor → judge
              INSUFFICIENT_EVIDENCE → best-effort Structural Agent
-         → citation/reference and semantic validation → report
+         → citation/reference and semantic validation
+         → Answer Quality Evaluator: original query + requirements + answer + evidence
+             PASS                  → report
+             REVISE                → targeted writer feedback
+             MORE_RESEARCH         → missing requirements only → update answer
+             INSUFFICIENT_EVIDENCE → accurately qualified answer
 ```
 
 The orchestrator owns all transitions, shared resource reservations and termination.
 No extraction, judge or writing model receives tools. `ResearchAgent.run()` is the
 CLI/UI adapter; async integrations can `await ResearchAgent.arun()`.
+
+Each extraction group starts as soon as its own searches complete. Searches share
+duplicate requests and cache isolated results; actual request starts, including
+retries, obey `SEARCH_REQUESTS_PER_SECOND`. Queued admission uses the run deadline,
+while each transport attempt receives its own request timeout. Raw retrieved
+documents remain in the evidence store; synthesis receives eligible findings and
+bounded original passages.
+
+Reports support direct rich-text editing, headings, emphasis, lists, links, tables,
+undo/redo, safe formula/chart previews, Markdown export and Print / PDF. Completed
+reports open ready to edit; Reading view preserves changes. Citations remain
+keyboard accessible in Reading view; Ctrl/Command+Enter opens the citation at the
+caret while editing. Citations show their source URL on hover. Autosave keeps a local
+recovery copy and a separately revisioned PostgreSQL document. Conflicting tabs
+retain their local edits and never overwrite a newer server revision. Streaming
+previews stay read-only and clearly incomplete; replay preserves edited reports.
+Edited documents do not modify research evidence or the original report events.
+
+`RESEARCH_MODEL` and `FINAL_WRITER_MODEL` configure the two roles in the backend.
+The writer defaults to `FINAL_WRITER_PROVIDER=aliyun`, `qwen3.8-flash`; research stays on `deepseek-v4.1-flash`. A different writer can use
+`FINAL_WRITER_INPUT_PRICE_PER_MILLION` and `FINAL_WRITER_OUTPUT_PRICE_PER_MILLION`
+for its own account-specific USD rates. See [writer evaluation](docs/WRITER_EVALUATION.md)
+for verified candidate capabilities and an evidence-frozen comparison tool.
 
 ## Run
 
@@ -87,7 +117,7 @@ The main page shows a compact research status derived from actual stage and tool
 boundaries: planning, searching, reading sources, checking findings, writing, and
 validation. The query input starts at one line, grows to 160px, submits with Enter,
 and accepts new lines with Shift+Enter (IME composition never submits). Research
-settings, activity history, and developer diagnostics are collapsed by default.
+activity history and developer diagnostics are collapsed by default.
 Source counts reflect unique retrieved URLs; there are no estimated percentages.
 
 Internal reasoning, intermediate JSON, tool payloads, and extracted findings remain
@@ -182,6 +212,16 @@ thinking character counts, observed usage, and HTTP status when available.
 Unreported token usage is marked unavailable. Tavily diagnostics identify
 connection, MCP initialization, tool execution, parsing, and session cleanup.
 
+The visible **Research outcome & issues** summary explains why a run stopped,
+which stage failed, its error category and cause, and any search recovery or
+planning fallback. The final web result also returns `stop_explanation`,
+`issues`, `warnings`, and `unresolved`, including failures from runs that
+continued with partial evidence. Call labels describe the work: **Define research
+plan**, **Generate search queries**, **Search Q13: <query>**, **Read sources and
+extract evidence**, **Evaluate evidence coverage**, **Write cited report**, and
+**Validate report citations**. Provider names and call numbers remain in the
+call details.
+
 The UI and CLI write compact diagnostic JSONL files to `reports/logs/<run-id>.jsonl`.
 These logs survive disconnections and server restarts. They contain timestamps,
 provider/stage metadata, endpoint and proxy hosts, limits, usage and safe failure
@@ -211,7 +251,9 @@ request and overall run time limits, budgets, and credential-safe log persistenc
 Use `uv run --no-editable deepsearchagent-ui --port 8001` to choose another port. The server runs
 only on your computer, accepts one research run at a time, and uses the existing
 agent's default limits. Keep the page open while research runs. No Node.js,
-frontend build is required to use the UI. The PostgreSQL driver is installed by `uv sync`.
+frontend build is required to use the UI: the editor bundle is checked in. When
+changing `frontend/`, run `npm ci --ignore-scripts` and `npm run build:web`.
+The PostgreSQL driver is installed by `uv sync`.
 
 `TAVILY_MCP_URL` defaults to `https://mcp.tavily.com/mcp/`. The client connects
 directly over Streamable HTTP, authenticates with a bearer header, and calls
@@ -232,7 +274,7 @@ src/deepsearchagent/
 ├── retrieval.py       # Bounded Tavily fan-out and transient retry
 ├── evidence_store.py  # Serialized merge, source/excerpt checks, atomic artifacts
 ├── budget.py          # Shared atomic token/time/request/cost reservations
-├── judge.py           # PAI/compatible judge, schema validation, READY gates
+├── judge.py           # Provider-agnostic evidence/answer judges and deterministic gates
 ├── benchmark.py       # Human-review queue, prediction and metrics
 ├── planner.py         # Bounded plan with source routing
 ├── researcher.py      # Evidence extraction and source validation
@@ -245,7 +287,7 @@ src/deepsearchagent/
 ├── pricing.py         # Per-run snapshot of estimated USD model/tool rates
 ├── system_prompt.py   # Shared prompt plus stage instructions and JSON Schema
 ├── prompts/system.md  # Compatibility workflow system prompt
-├── prompts/judge.md   # Independently configurable evidence-sufficiency rubric
+├── prompts/judge.md   # Relevance-focused final-answer rubric
 └── tools/
     ├── search.py        # SearchProvider contract and routing
     ├── tavily.py        # Tavily MCP transport and tool call
@@ -295,53 +337,70 @@ The planner and verifier choose `source="web"` or `source="documentation"` only
 from the injected providers. Both pass through the same evidence and citation
 pipeline. `agent.graph` exposes the compiled LangGraph for inspection.
 
-## PAI classifier configuration
+## Quality evaluator configuration
 
-By default, `JUDGE_PROVIDER=research` uses the same research model, adapter,
-shared budget, retry and truncation recovery as every other research stage.
-The dedicated evidence rubric and deterministic READY gates remain in use.
+The default online judge is `JUDGE_PROVIDER=aliyun`, `JUDGE_MODEL=qwen3.8-max`.
+It uses the same Aliyun endpoint and credentials as research, unless `JUDGE_BASE_URL`
+is explicitly set. The provider-agnostic adapter also supports Kimi, opt-in PAI
+(`JUDGE_MODEL_TOKEN` and an explicit PAI model), or `JUDGE_PROVIDER=research`.
+SDK retries are disabled; the controller allows at most `JUDGE_RETRIES=1` recovery
+per evaluation. A failed evaluation remains unverified and never becomes a quality pass.
 
-An independent classifier remains opt-in: set `JUDGE_PROVIDER=pai`, enable the
-PAI service, and supply `JUDGE_MODEL_TOKEN`. Its compatible adapter preserves
-[Alibaba's authentication contract](https://www.alibabacloud.com/help/en/pai/judge-model-api-reference).
-`JUDGE_MODEL`, `JUDGE_BASE_URL`, JSON mode, temperature and optional fallback
-settings apply to independent classifiers. `JUDGE_PROMPT_PATH` applies to both modes.
+Evidence readiness uses [evidence-judge.md](src/deepsearchagent/prompts/evidence-judge.md)
+and the existing deterministic requirement/excerpt gates. Final-answer evaluation uses
+[judge.md](src/deepsearchagent/prompts/judge.md) and a strict `QualityEvaluation` JSON contract.
+The final judge sees the original question (including explicit constraints), extracted
+requirements, actual rendered report, source excerpts and citation metadata, completion
+status, and configurable thresholds. It assesses relevance, requirement coverage,
+factual grounding, citation quality, analysis and uncertainty. It cannot verify remote
+URL availability from metadata alone and must distinguish unverified from false claims.
 
-Use `JUDGE_MODEL=pai-judge-plus` to evaluate the higher-capability candidate.
-Compatible Qwen classifiers use `JUDGE_PROVIDER=aliyun`, their model ID and a verified
-`JUDGE_BASE_URL`. `JUDGE_FALLBACK_PROVIDER`, `JUDGE_FALLBACK_MODEL` and
-`JUDGE_FALLBACK_BASE_URL` configure an optional separate fallback. Both use the same
-rubric and validation. Strict schema mode (`JUDGE_JSON_MODE=json_schema`) is opt-in:
-verify the exact model, endpoint and region against [Qwen structured-output documentation](https://www.alibabacloud.com/help/en/model-studio/qwen-structured-output).
-It is not assumed for PAI. `JUDGE_PROMPT_PATH` overrides the dedicated
-[prompt](src/deepsearchagent/prompts/judge.md). Threshold, temperature, input/output
-limits, timeout and retry settings are listed in `.env.example`.
+Primary and grounding scores must be at least 4/5; the weighted overall score must be
+at least 4/5. These defaults are configurable through `QUALITY_MIN_PRIMARY_SCORE`,
+`QUALITY_MIN_GROUNDING_SCORE`, and `QUALITY_MIN_OVERALL_SCORE`. Scores do not establish
+calibrated model accuracy. Unknown IDs, omitted requirement assessments and invalid
+schemas are hard failures. A proposed PASS cannot bypass code-level evidence gates.
 
-READY requires estimated coverage ≥0.90 by default, computed weighted requirement
-coverage ≥that threshold, every critical requirement COVERED, actual supporting
-excerpts and known references, and no critical unsupported findings or material
-unresolved contradictions. Scores are not calibrated confidence probabilities.
-An unsafe advisory READY is rejected and writing proceeds with disclosed limitations.
-One bounded recovery is allowed for transient or invalid judge results; an optional
-fallback gets one attempt. Authentication errors are not repeatedly retried.
-If all judges fail, the controller retains deterministic source/excerpt checks and
-writes a qualified best-effort report; it does not invent an insufficiency verdict.
+`QUALITY_MAX_ITERATIONS=2` bounds additional corrections. REVISE sends the previous
+answer and specific feedback to the writer. MORE_RESEARCH retrieves only queries attached
+to missing requirement IDs and preserves the evidence store and initial plan. All work
+shares the existing time, request, token and optional cost limits. Evaluation snapshots,
+advisory decisions, gated decisions and scores are retained under the session directory.
+`JUDGE_PROMPT_PATH` can override the rubric; server-side gates remain mandatory.
+
+The **Error Center** is accessible from the status icon. It retains grouped retry history,
+timestamps, severity, recovery and request/correlation identifiers. Toast dismissal
+preserves that history. Recovered issues stop contributing to the unresolved count.
+Only a terminal failure without a usable answer opens a blocking dialog. Waterfall
+rows preserve overlapping calls and parent tasks; detailed causes are labeled confirmed,
+suspected or unknown. Reports contain research limitations, never operational warnings.
 
 ## Limits and output
 
-Defaults: 15 initial queries in three groups of five, three concurrent LLM
+Defaults: one or two queries per requirement, up to 15 initial queries in groups
+of at most five (fewer for simple questions or small search budgets), three concurrent LLM
 requests, maximum two additional rounds and five targeted queries per round,
 25 search attempts, 20 model attempts, 240,000 reserved/observed tokens and 600 seconds.
-Retries and continuations consume the same request, token, time and cost limits.
+Transient retries consume the same request, token, time and cost limits.
+Timeouts and output limits move forward with available results instead of restarting
+the stage. `MAX_CONTINUATIONS=0` is the default; planning, query generation, extraction
+and writing always salvage partial output without requesting continuations.
 
-Initial output allocations are 16,384 for planning, extraction and evaluation,
-32,768 for writing, and 8,192 for semantic validation. Input caps are 24,000 for
+Planning and query generation each have a 4,096-token output ceiling and a
+30-second deadline (lower configured limits still apply). Output allocations are
+16,384 for extraction and evaluation,
+32,768 for writing, and at most 4,096 for semantic validation. The citation check
+disables thinking where supported and has a 20-second deadline. Input caps are 24,000 for
 planning/extraction, 32,000 for evaluation and 64,000 for writing. All are
 configurable. Capability ceilings and available shared budgets can lower an
-allocation; bounded continuation can double it. Conservative UTF-8 byte bounds
+allocation. Conservative UTF-8 byte bounds
 include prompt/schema overhead. Requirement-balanced evidence compaction preserves
 IDs, source URLs and essential excerpts, and records omitted findings.
-Continuation includes the exact checkpoint and counts it against context and budget.
+Complete streamed findings survive a stage deadline and pass the same source checks
+as completed output. Complete report paragraphs still require semantic validation;
+if writing or validation cannot finish, stored findings form a cited best-effort report.
+Planning failures can fall back to the original question; query failures use the
+completed plan requirements. The compact plan is saved in `research_facts.md`.
 Observed provider usage replaces reservations; unavailable usage retains the full
 reservation and marks `token_usage_complete=false`. Reasoning tokens are a subset
 of billed output and are never counted twice.

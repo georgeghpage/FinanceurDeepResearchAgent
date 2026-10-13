@@ -8,7 +8,7 @@ test('normal research reaches actual backend, cites sources and downloads report
   await submit(page, 'Establish facts in 中文 in 2026');
   await complete(page);
   expect(requests).toHaveLength(1);
-  expect(requests[0]).toMatchObject({ question: 'Establish facts in 中文 in 2026', provider: 'aliyun', model: 'deepseek-v4.1-flash' });
+  expect(requests[0]).toMatchObject({ question: 'Establish facts in 中文 in 2026' });
   await expect(page.locator('#answer')).toContainText('measured value of 42');
   await expect(page.locator('#answer h1')).toHaveText('Evidence report');
   const link = page.locator('#answer a').first();
@@ -20,6 +20,8 @@ test('normal research reaches actual backend, cites sources and downloads report
   let body = ''; for await (const chunk of stream) body += chunk;
   expect(body).toContain('[S1: Official publication]');
   await expect(page.locator('#events')).toContainText('Planning research');
+  await expect(page.locator('#dashboard-rows')).toContainText('Search Q1:');
+  await expect(page.locator('#dashboard-outcome')).toContainText('sufficient evidence coverage');
 });
 
 test('refinement searches only targeted follow-up and completes', async ({ page }) => {
@@ -28,17 +30,23 @@ test('refinement searches only targeted follow-up and completes', async ({ page 
   await complete(page);
   expect(await page.locator('#events li').filter({ hasText: 'Searching the web' }).count()).toBe(2);
   await expect(page.locator('#events')).not.toContainText('targeted additional evidence');
-  await expect(page.locator('#answer')).toContainText('Search calls: 16');
+  await expect(page.locator('#status')).toContainText('16 searches');
 });
 
 test('provider failure ends loading with usable explanation', async ({ page }) => {
   await open(page);
   await submit(page, '[failure] Provider rejected planning');
   await complete(page);
-  await expect(page.locator('#answer')).toContainText('provider_unavailable');
+  await expect(page.locator('#answer')).not.toContainText('provider_unavailable');
+  await expect(page.locator('#critical-error')).toBeVisible();
+  await page.locator('#critical-inspect').click();
   await expect(page.locator('#answer')).not.toContainText('CANARY-INTERNAL-SECRET');
   await expect(page.locator('#typing')).toBeHidden();
   await expect(page.locator('#stop')).toBeHidden();
+  await expect(page.locator('#dashboard-issues')).toBeVisible();
+  await expect(page.locator('#dashboard-issue-list')).toContainText('Provider unavailable');
+  await expect(page.locator('#dashboard-outcome')).toContainText('during plan');
+  await expect(page.locator('#dashboard-issues')).not.toContainText('CANARY-INTERNAL-SECRET');
 });
 
 test('cancellation reaches backend and cannot later become completion', async ({ page }) => {
@@ -49,7 +57,7 @@ test('cancellation reaches backend and cannot later become completion', async ({
   await page.locator('#stop').click();
   expect((await stopped).status()).toBe(200);
   await complete(page);
-  await expect(page.locator('#answer')).toContainText('Stop reason: cancelled');
+  await expect(page.locator('#answer')).toContainText('Research stopped by the user');
   await expect(page.locator('#activity-title')).toHaveText('Research stopped');
 });
 
@@ -151,9 +159,19 @@ test('long report renders completely and remains keyboard accessible', async ({ 
   await expect(page.locator('#answer h2').filter({ hasText: 'Evidence section' })).toHaveCount(3);
   await expect(page.locator('#answer a').filter({ hasText: 'Official publication' })).toHaveCount(24);
   const last = page.locator('#answer a').last();
+  // Native links inside Firefox contenteditable are caret destinations;
+  // reading mode exposes normal link focus without removing editing support.
+  await page.locator('#edit-toggle').click();
   await last.scrollIntoViewIfNeeded();
   await last.focus();
   await expect(last).toBeFocused();
+  // Editing mode remains keyboard reachable, with source activation covered
+  // through Ctrl/Command+Enter in document.spec.cjs.
+  await page.locator('#edit-toggle').click();
+  const document = page.locator('#answer .tiptap');
+  await document.focus();
+  await expect(document).toBeFocused();
+  await expect(document).toHaveAttribute('contenteditable', 'true');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await info.attach('ui-latency', { body: JSON.stringify({ firstUpdateMs, reportMs, provider: 'scripted' }), contentType: 'application/json' });
 });
@@ -196,7 +214,7 @@ test('temporary search error recovers and final answer streams through the actua
   await open(page);
   await submit(page, '[retry] Recover search');
   await complete(page);
-  await expect(page.locator('#answer')).toContainText('Search calls: 16');
+  await expect(page.locator('#status')).toContainText('16 searches');
   await expect(page.locator('#events')).not.toContainText('CANARY-INTERNAL-SECRET');
   await page.locator('#activity-history summary').click();
   const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-trace').click()]);
@@ -213,12 +231,14 @@ for (const mode of ['partial-search', 'search-unavailable']) {
     await open(page);
     await submit(page, `[${mode}] Preserve research`);
     await complete(page);
-    await expect(page.locator('#answer')).toContainText('Limitations');
+    if (mode === 'search-unavailable') await expect(page.locator('#answer')).toContainText('Limitations');
     await expect(page.locator('#answer')).not.toContainText('CANARY-INTERNAL-SECRET');
     await expect(page.locator('#error')).toBeHidden();
     if (mode === 'partial-search') {
-      await expect(page.locator('#answer')).toContainText('Source coverage incomplete');
+      await expect(page.locator('#answer')).not.toContainText('Source coverage incomplete');
+      await page.locator('#error-center-toggle').click();
+      await expect(page.locator('#dashboard-issue-list')).toContainText('Provider unavailable');
       await expect(page.locator('#answer a')).not.toHaveCount(0);
-    } else await expect(page.locator('#answer')).toContainText('No eligible source-backed evidence');
+    } else await expect(page.locator('#answer')).toContainText('No source-backed evidence');
   });
 }

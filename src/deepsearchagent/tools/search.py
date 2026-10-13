@@ -3,6 +3,7 @@
 from typing import Protocol
 import time
 import asyncio
+from asyncio import sleep as rate_wait
 import threading
 import concurrent.futures
 from contextvars import ContextVar
@@ -33,6 +34,11 @@ class SearchRouter:
         self.last_failure: FailureDiagnostic | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._calls_lock = threading.Lock()
+        self._cache = {}
+        self._inflight = {}
+        self._waiters = {}
+        self._next_request = 0.0
+        self._active = 0
 
     def provider_name(self, source: str) -> str:
         provider = self.web if source == "web" else self.documentation
@@ -48,6 +54,9 @@ class SearchRouter:
         self.budget = budget
         self._semaphore = None
         self.session_started = time.monotonic()
+        self._cache.clear()
+        self._inflight.clear()
+        self._next_request = 0.0
 
     def search(self, task: ResearchTask, *, timeout: float) -> SearchResult:
         # The sync workflow shares exactly the async transport/retry behavior.
@@ -72,6 +81,40 @@ class SearchRouter:
         return await cancellable_wait(asyncio.wrap_future(future), self.cancellation)
 
     async def asearch(self, task: ResearchTask, *, timeout: float) -> SearchResult:
+        from .retry import cancellable_wait
+        if self.cancellation:
+            self.cancellation.check()
+        key = (task.source, " ".join(task.query.split()))
+        if key in self._cache:
+            self.trace({"kind": "search_cache_hit", "stage": "search", "query": task.query})
+            return self._cache[key].model_copy(deep=True)
+        shared = self._inflight.get(key)
+        if shared is None:
+            shared = asyncio.create_task(self._execute(task, timeout=timeout))
+            self._inflight[key] = shared
+        self._waiters[shared] = self._waiters.get(shared, 0) + 1
+        try:
+            result = await cancellable_wait(asyncio.shield(shared), self.cancellation)
+            self._cache[key] = result.model_copy(deep=True)
+            return result.model_copy(deep=True)
+        finally:
+            self._waiters[shared] -= 1
+            if self._waiters[shared] == 0:
+                self._waiters.pop(shared)
+                if not shared.done():
+                    shared.cancel()
+                await asyncio.gather(shared, return_exceptions=True)
+            if shared.done() and self._inflight.get(key) is shared:
+                self._inflight.pop(key, None)
+
+    async def aclose(self):
+        tasks = list(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
+
+    async def _execute(self, task: ResearchTask, *, timeout: float) -> SearchResult:
         import hashlib
         from uuid import uuid4
         from .retry import RetryPolicy
@@ -85,16 +128,46 @@ class SearchRouter:
         loop = asyncio.get_running_loop()
         if self._semaphore is None or self._semaphore_loop is not loop:
             self._semaphore = asyncio.Semaphore(self.retry_policy.config.search_concurrency)
+            self._pace_lock = asyncio.Lock()
             self._semaphore_loop = loop
         provider = self.web if task.source == "web" else self.documentation
         if provider is None:
             raise SearchError("Documentation search has no provider plugged in.")
         self.last_failure = None
+        from .retry import cancellable_wait
         started = time.monotonic()
         timeout = min(timeout, self.retry_policy.config.max_seconds - (started - self.session_started))
-        context = {**SEARCH_CONTEXT.get(), "invocation_id": str(uuid4()), "query_ref": hashlib.sha256(task.query.encode()).hexdigest()[:16]}
+        from ..diagnostics import CALL_CONTEXT
+        context = {**CALL_CONTEXT.get(), **SEARCH_CONTEXT.get(), "operation": "search", "invocation_id": str(uuid4()), "query_ref": hashlib.sha256(task.query.encode()).hexdigest()[:16]}
 
         async def operation(remaining, meta):
+            from .retry import cancellable_wait
+            async with self._semaphore:
+                # Pace actual transport starts, including retries. Reserving
+                # slots before semaphore admission can release queued bursts.
+                async with self._pace_lock:
+                    while True:
+                        delay = max(self._next_request, self.retry_policy.cooldown_until) - time.monotonic()
+                        if delay <= 0:
+                            break
+                        await cancellable_wait(rate_wait(delay), self.cancellation)
+                    if self.cancellation:
+                        self.cancellation.check()
+                    self._next_request = time.monotonic() + 1 / self.retry_policy.config.search_requests_per_second
+                remaining = min(timeout, self.retry_policy.config.max_seconds - (time.monotonic() - self.session_started))
+                if self.budget:
+                    remaining = min(remaining, self.budget.remaining_time())
+                    meta["search_id"] = self.budget.reserve_search()
+                meta["timeout_seconds"] = remaining
+                self._active += 1
+                self.trace({"kind": "search_concurrency", "active": self._active,
+                            "limit": self.retry_policy.config.search_concurrency})
+                try:
+                    return await asyncio.wait_for(attempt(remaining, meta), remaining)
+                finally:
+                    self._active -= 1
+
+        async def attempt(remaining, meta):
             with self._calls_lock:
                 if not self.budget and self.calls >= self.retry_policy.config.max_searches:
                     from ..llm import BudgetExceeded
@@ -102,6 +175,7 @@ class SearchRouter:
                 self.calls += 1
                 call_id = self.calls
             meta.setdefault("search_id", call_id)
+            attempt_started = time.monotonic()
             self.trace({"kind": "search_start", **meta, "query": task.query, "source": task.source})
             token = SEARCH_CONTEXT.set(meta)
             try:
@@ -110,14 +184,15 @@ class SearchRouter:
                     raise SearchError(result.failure.message, diagnostic=result.failure)
                 self.trace({"kind": "search_complete", **meta, "query": task.query,
                             "source_count": len(result.sources), "sources": [s.model_dump() for s in result.sources],
-                            "duration_seconds": round(time.monotonic() - started, 3)})
+                            "duration_seconds": round(time.monotonic() - attempt_started, 3)})
                 return result
             finally:
                 SEARCH_CONTEXT.reset(token)
 
         try:
-            async with self._semaphore:
-                return await self.retry_policy.run(operation, timeout=timeout, started=started,
+            return await self.retry_policy.run(operation,
+                    timeout=self.retry_policy.config.max_seconds - (started - self.session_started),
+                    started=started, reserve_in_operation=True,
                     provider=self.provider_name(task.source), trace=self.trace, context=context,
                     cancellation=self.cancellation, budget=self.budget)
         except ResearchCancelled:

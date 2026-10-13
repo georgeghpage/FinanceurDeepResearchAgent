@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float)
     parser.add_argument("--max-cost-usd", type=float, help="USD ceiling; requires configured prices for every model")
     parser.add_argument("--session-dir", help="Parent directory for isolated research_facts.md artifacts")
-    parser.add_argument("--judge-model", help="Classifier model, independent of the research model")
+    parser.add_argument("--judge-model", help="Independent classifier model (requires JUDGE_PROVIDER=pai, aliyun, or kimi)")
     parser.add_argument("--output", type=Path, help="Save Markdown here instead of printing it")
     parser.add_argument("--state", type=Path, help="Save the research plan, evidence, sources, and usage as JSON")
     parser.add_argument("--log", type=Path, help="Diagnostic JSONL file (default: reports/logs/<run-id>.jsonl)")

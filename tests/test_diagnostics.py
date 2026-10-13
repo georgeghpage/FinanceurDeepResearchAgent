@@ -12,16 +12,36 @@ import httpx
 from openai import APIStatusError, APITimeoutError
 
 from deepsearchagent.config import Config
-from deepsearchagent.diagnostics import DiagnosticJournal, failure_from_exception, run_metadata
+from deepsearchagent.diagnostics import DiagnosticJournal, failure_from_exception, research_outcome, run_metadata
 from deepsearchagent.llm import BudgetExceeded, KimiBackend, ResponseError
-from deepsearchagent.models import ResearchPlan
+from deepsearchagent.models import ResearchPlan, ResearchState
 from deepsearchagent.orchestrator import SequentialResearchAgent as ResearchAgent
 from deepsearchagent.tools.search import SearchError, SearchRouter
 from deepsearchagent.tools.tavily import TavilyMCPSearch
 from test_agent import FakeSearch, ScriptedBackend, TASK, extraction, verification, draft
 from test_streaming import chunk
+from support_fixtures import plan
 
 SECRET = "PRIVATE-API-KEY-AND-RESPONSE"
+
+
+class OutcomeTests(unittest.TestCase):
+    def test_stop_reasons_and_report_failure_explain_unfinished_research(self):
+        for reason, expected in (("round_limit", "round limit"), ("budget", "limit"),
+                                 ("no_tasks", "follow-up"), ("cancelled", "user's request"), ("error", "stopped")):
+            with self.subTest(reason=reason):
+                self.assertIn(expected, research_outcome(ResearchState(question="Facts", stop_reason=reason)))
+        state = ResearchState(question="Facts", stop_reason="coverage", report_status="best_effort_assembled")
+        self.assertIn("report generation", research_outcome(state))
+        state.report_status = "generated"
+        state.warnings = ["Some searches were unavailable."]
+        self.assertIn("with limitations", research_outcome(state))
+        state.warnings = []
+        self.assertIn("completed", research_outcome(state))
+
+    def test_unavailable_evaluation_is_distinct_from_no_followups(self):
+        state = ResearchState(question="Facts", plan=plan())
+        self.assertIn("evaluation did not finish", research_outcome(state))
 
 
 def status_error(status):
@@ -171,7 +191,7 @@ class RunFailureTests(unittest.TestCase):
         self.assertEqual((state.failure.provider, state.failure.stage, state.failure.call_id), ("kimi", "verify", 3))
         self.assertEqual(state.failure.category, "output_limit")
         self.assertEqual((len(state.sources), state.search_calls, state.api_calls), (1, 1, 3))
-        self.assertIn("kimi / output", report)
+        self.assertNotIn("kimi / output", report)
         self.assertEqual(events[-1]["kind"], "run_stopped")
         self.assertEqual(events[-1]["failure"]["finish_reason"], "length")
         self.assertIn("search_complete", [e["kind"] for e in events])
@@ -197,7 +217,8 @@ class RunFailureTests(unittest.TestCase):
                 self.assertEqual(failure["category"], category)
                 self.assertEqual(backend.calls, 2)
                 self.assertEqual(state.sources, [])
-                self.assertIn("Source coverage incomplete", report)
+                self.assertTrue(any("Source coverage incomplete" in w for w in state.warnings))
+                self.assertNotIn("Source coverage incomplete", report)
                 self.assertNotIn(SECRET, json.dumps(events) + state.model_dump_json() + report)
 
     def test_budget_matrix_is_attributed_to_agent_not_to_search_provider(self):

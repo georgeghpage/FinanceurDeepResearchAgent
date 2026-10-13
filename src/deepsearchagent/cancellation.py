@@ -1,6 +1,7 @@
 """Cooperative cancellation with interruptible waits for provider I/O."""
 
 import threading
+from contextvars import copy_context
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -42,7 +43,8 @@ class Cancellation:
             finally:
                 completed.set()
 
-        threading.Thread(target=work, daemon=True).start()
+        context = copy_context()
+        threading.Thread(target=lambda: context.run(work), daemon=True).start()
         while not completed.wait(0.025):
             self.check()
         self.check()

@@ -102,6 +102,7 @@ async function loadHistory(append = false) {
 }
 
 function resetChat() {
+  if (typeof ReportEditor !== "undefined") ReportEditor.reset();
   pendingRun = null;
   stopping = false;
   updateProvider();
@@ -138,16 +139,12 @@ async function openChat(id) {
     traceEvents = chat.events;
     $("activity").hidden = false;
     for (const data of chat.events) {
-      dashboard.receive(data);
+      dashboard.receive({ ...data, replay: true });
       if (data.type === "trace") receiveTrace(data);
       if (data.type === "progress") receiveLegacyProgress(data);
       if (data.type === "status") receiveStatus(data);
       if (data.type === "answer_start" || data.type === "answer_delta") receiveAnswer(data);
       if (data.type === "result") showResult(data);
-      if (data.type === "error") {
-        $("error").textContent = data.failure ? failureDescription(data.failure) : data.message;
-        $("error").hidden = false;
-      }
     }
     if (chat.status === "running") {
       dashboard.finish("running");
@@ -167,8 +164,7 @@ async function openChat(id) {
       $("status").textContent = "Saved trace retained. Start a new chat to try again.";
     }
   } catch (error) {
-    $("error").textContent = error.message;
-    $("error").hidden = false;
+    dashboard.errorCenter.notify(error.message);
   } finally {
     openingChat = false;
     updateRunControls();
@@ -179,7 +175,10 @@ async function openChat(id) {
 function showResult(data) {
   stopping = false;
   report = data.report;
-  renderReport(report);
+  if (typeof ReportEditor !== "undefined") {
+    ReportEditor.finish(data.run_id || selectedChat || pendingRun?.id || data.session_id, report,
+      data.status ? data.status !== "COMPLETE" : data.stop_reason !== "coverage");
+  } else renderReport(report);
   $("answer-section").hidden = false;
   $("typing").hidden = true;
   $("activity").className = data.stop_reason === "cancelled" ? "activity stopped" : data.failure ? "activity failed" : "activity done";
@@ -189,11 +188,10 @@ function showResult(data) {
   $("source-count").textContent = "";
   $("status").textContent = `${data.sources} source${data.sources === 1 ? "" : "s"} · ${data.search_calls} searches · ${data.api_calls} model calls · ${data.tokens_used} tokens · ${Math.round(data.elapsed_seconds)}s${partial ? " · See the report's limitations." : ""}`;
   $("elapsed").textContent = `${Math.round(data.elapsed_seconds || 0)}s`;
-  if (data.failure) {
-    $("error").textContent = failureDescription(data.failure);
-    $("error").hidden = false;
+  if (!openingChat && data.failure && (data.status === "FAILED" || !data.report)) {
+    dashboard.errorCenter.notify(failureDescription(data.failure), true);
   } else {
-    $("error").hidden = true;
+    dashboard.errorCenter.dismissToast();
   }
 }
 
@@ -282,16 +280,22 @@ function receiveStatus(data) {
 }
 
 function receiveAnswer(data) {
+  if (typeof ReportEditor !== "undefined" && ReportEditor.hasEdits()) return;
   if (data.type === "answer_start") {
     report = "";
     answerChunk = -1;
+    if (typeof ReportEditor !== "undefined") ReportEditor.reset();
     $("answer").replaceChildren();
     return;
   }
   if (data.chunk_index <= answerChunk || typeof data.text !== "string") return;
   answerChunk = data.chunk_index;
   report += data.text;
-  renderReport(report);
+  // Only complete blocks enter the streaming preview; incomplete Markdown waits.
+  if (typeof ReportEditor !== "undefined") {
+    const boundary = report.lastIndexOf("\n\n");
+    if (boundary >= 0 && data.text.includes("\n")) ReportEditor.preview(report.slice(0, boundary));
+  } else renderReport(report);
   $("answer-section").hidden = false;
   $("typing").hidden = true;
 }
@@ -309,6 +313,15 @@ function receiveLegacyProgress(data) {
 }
 
 function receiveTrace(data) {
+  if (data.kind === "report_preview" && typeof ReportEditor !== "undefined") {
+    if (!ReportEditor.hasEdits()) {
+      report = data.report;
+      ReportEditor.preview(report);
+      $("answer-section").hidden = false;
+      $("typing").hidden = true;
+    }
+    return;
+  }
   // Legacy saved traces get the same compact presentation. Internal deltas,
   // tool arguments and extracted findings never enter the answer renderer.
   if (data.kind === "cancellation_requested") {
@@ -322,7 +335,7 @@ function receiveTrace(data) {
   const stages = { plan: ["planning", "Planning research…"], search: ["searching", "Searching the web…"],
     extract: ["reading", "Reading sources…"], verify: ["checking", "Cross-checking findings…"],
     write: ["writing", "Writing the answer…"], validate: ["finalizing", "Finalizing research…"] };
-  const schemas = { ResearchPlan: "plan", EvidencePlan: "plan", Extraction: "extract", EvidenceExtraction: "extract",
+  const schemas = { PlanningBrief: "plan", QueryBatch: "plan", ResearchPlan: "plan", EvidencePlan: "plan", Extraction: "extract", EvidenceExtraction: "extract",
     Verification: "verify", JudgeDecision: "verify", ReportDraft: "write", ReportAudit: "validate" };
   let status;
   if (data.kind === "plan") status = stages.plan;
@@ -413,7 +426,10 @@ $("research-form").addEventListener("submit", async (event) => {
   $("typing").hidden = true;
   resizeQuestion();
   updateHistorySelection();
-  if (!resuming) report = "";
+  if (!resuming) {
+    report = "";
+    if (typeof ReportEditor !== "undefined") ReportEditor.reset();
+  }
   $("submit").disabled = true;
   $("submit").textContent = "Researching…";
   $("question").readOnly = true;
@@ -461,6 +477,7 @@ $("research-form").addEventListener("submit", async (event) => {
     } else if (data.type === "result") {
       showResult(data);
     } else if (data.type === "error") {
+      dashboard.errorCenter.notify(data.failure ? failureDescription(data.failure) : data.message, true);
       throw new Error(data.failure ? failureDescription(data.failure) : data.message);
     }
     if (data.sequence) lastSequence = data.sequence;
@@ -484,7 +501,7 @@ $("research-form").addEventListener("submit", async (event) => {
             ? await fetch(`/api/research/${runId}?after=${lastSequence}`)
             : await fetch("/api/research", {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ question, run_id: runId, provider, model }),
+              body: JSON.stringify({ question, run_id: runId }),
             });
         } catch (_) { throw new ConnectionError("Could not reach the research server."); }
         if (!response.ok) {
@@ -519,8 +536,7 @@ $("research-form").addEventListener("submit", async (event) => {
     $("activity-title").textContent = disconnected ? "Connection lost" : "Research failed";
     $("status").className = "";
     $("status").textContent = disconnected ? "Click Reconnect research to resume this run." : "You can try again below.";
-    $("error").textContent = error.message || "Could not connect to the research agent.";
-    $("error").hidden = false;
+    dashboard.errorCenter.notify(error.message || "Could not connect to the research agent.");
 
   } finally {
     clearInterval(timer);
@@ -554,8 +570,7 @@ $("stop").addEventListener("click", async () => {
     if (pendingRun?.id !== runId) return;
     stopping = false;
     updateRunControls();
-    $("error").textContent = error.message || "Could not stop research. Try again.";
-    $("error").hidden = false;
+    dashboard.errorCenter.notify(error.message || "Could not stop research. Try again.");
   }
 });
 
@@ -571,7 +586,7 @@ $("download-trace").addEventListener("click", () => {
 
 $("download").addEventListener("click", () => {
   if (!report) return;
-  const url = URL.createObjectURL(new Blob([report], { type: "text/markdown;charset=utf-8" }));
+  const url = URL.createObjectURL(new Blob([typeof ReportEditor !== "undefined" ? (ReportEditor.markdown() || report) : report], { type: "text/markdown;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
   link.download = "research-report.md";

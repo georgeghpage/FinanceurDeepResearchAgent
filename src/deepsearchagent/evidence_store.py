@@ -115,6 +115,8 @@ class EvidenceStore:
                  "", "## Original question", state.question, "", "## Current research status", state.status,
                  f"Stop reason: {state.stop_reason}", "", "## Research requirements"]
         lines += [f"- {r.id} (critical={r.critical}, weight={r.weight}): {r.question}" for r in requirements]
+        if getattr(state.plan, "steps", None):
+            lines += ["", "## Research plan", state.plan.objective, *[f"- {s}" for s in state.plan.steps]]
         lines += ["", "## Key findings and evidence excerpts"]
         for finding in state.findings:
             lines += [f"- {finding.id} / {finding.requirement_id} / {finding.evidence_status}: {finding.claim}",
@@ -141,5 +143,15 @@ class EvidenceStore:
                   "advisory_decision": advisory or decision.model_dump()}
         self.state.judge_history.append(record)
         atomic_write(self.directory / f"evaluation-{len(self.state.judge_history)}.json",
+                     json.dumps({**record, "snapshot": snapshot}, ensure_ascii=False, indent=2))
+        return record
+
+
+    def save_quality_evaluation(self, snapshot, decision, provider, model, advisory):
+        raw = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
+        record = {"evidence_version": self.state.evidence_version, "snapshot_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                  "provider": provider, "model": model, "decision": decision.model_dump(), "advisory_decision": advisory}
+        self.state.quality_history.append(record)
+        atomic_write(self.directory / f"quality-evaluation-{len(self.state.quality_history)}.json",
                      json.dumps({**record, "snapshot": snapshot}, ensure_ascii=False, indent=2))
         return record

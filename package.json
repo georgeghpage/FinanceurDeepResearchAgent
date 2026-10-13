@@ -6,10 +6,22 @@
     "test:browser": "playwright test --project=chromium",
     "test:browser:matrix": "playwright test --project=chromium --project=firefox --project=webkit",
     "test:visual": "playwright test --project=visual",
-    "test:visual:update": "playwright test --project=visual --update-snapshots"
+    "test:visual:update": "playwright test --project=visual --update-snapshots",
+    "build:web": "esbuild frontend/report-editor.js --bundle --minify --format=iife --outfile=src/deepsearchagent/web/editor.js"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.11.0",
-    "@playwright/test": "^1.56.0"
+    "@playwright/test": "^1.56.0",
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "@tiptap/core": "^3.31.4",
+    "@tiptap/extension-link": "^3.31.4",
+    "@tiptap/extension-table": "^3.31.4",
+    "@tiptap/markdown": "^3.31.4",
+    "@tiptap/starter-kit": "^3.31.4",
+    "dompurify": "^3.4.17",
+    "katex": "^0.19.0",
+    "marked": "^18.1.1"
   }
 }

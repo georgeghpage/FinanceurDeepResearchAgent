@@ -77,3 +77,16 @@ class AliyunConfigurationTests(unittest.TestCase):
                           {"aliyun_base_url": "https://key@example.com/v1"}):
             with self.assertRaises(ValueError):
                 Config(**overrides)
+
+    def test_migrated_defaults_and_environment_capabilities(self):
+        with patch.dict(os.environ, {}, clear=True), patch("deepsearchagent.config.dotenv_values", return_value={}):
+            config = Config.from_env()
+        self.assertEqual((config.provider, config.model, config.judge_provider), ("aliyun", "deepseek-v4.1-flash", "aliyun"))
+        self.assertEqual(config.reasoning_effort, "low")
+        self.assertTrue(config.thinking_enabled)
+        from deepsearchagent.capabilities import inference_options, model_limits
+        self.assertEqual(inference_options(config), {"reasoning_effort": "low", "extra_body": {"enable_thinking": True}})
+        self.assertEqual(model_limits(config), (1000000, 393216))
+        self.assertEqual(inference_options(Config(model="unverified-model")), {})
+        self.assertEqual(model_limits(Config(model="unverified-model")), (32768, 8192))
+        self.assertEqual(inference_options(Config(thinking_enabled=False)), {"extra_body": {"enable_thinking": False}})

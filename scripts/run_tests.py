@@ -61,8 +61,10 @@ SUITES = {
         "test_reliability",
         "test_research_experience",
         "test_orchestration_edges",
+        "test_fast_pipeline",
+        "test_document_pipeline",
     ],
-    "evaluation": ["test_benchmark", "test_quality"],
+    "evaluation": ["test_benchmark", "test_quality", "test_answer_quality"],
     "security": [
         "test_security",
         "test_storage_reliability",

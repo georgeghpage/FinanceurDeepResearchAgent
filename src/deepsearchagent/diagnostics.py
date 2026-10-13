@@ -5,6 +5,8 @@ The browser's full trace remains separate from these metadata-only JSONL logs.
 """
 
 import json
+import hashlib
+from contextvars import ContextVar
 import os
 import re
 import ssl
@@ -22,6 +24,9 @@ from pydantic import ValidationError
 
 from .models import FailureDiagnostic
 from .pricing import pricing_metadata
+from .capabilities import inference_options, model_limits
+
+CALL_CONTEXT: ContextVar[dict] = ContextVar("model_trace_context", default={})
 
 MESSAGES = {
     "authentication": "Provider rejected authentication or access (check the key and endpoint).",
@@ -60,6 +65,7 @@ MESSAGES = {
     "context_overflow": "Provider context window was exceeded.",
     "circuit_open": "Search temporarily paused after repeated provider failures.",
     "input_budget": "The stage input context limit was reached.",
+    "storage_error": "Session history or diagnostic storage is unavailable; research can continue.",
     "unexpected_error": "An unexpected application error stopped this operation.",
 }
 
@@ -70,6 +76,31 @@ class DiagnosticError(RuntimeError):
         super().__init__(message)
         self.category = category
         self.diagnostic = diagnostic
+
+
+def research_outcome(state) -> str:
+    """Explain the actual stopping condition, including qualified coverage results."""
+    if state.stop_reason == "cancelled":
+        return "Research stopped at the user's request; the full plan was not completed."
+    if state.failure:
+        return f"Research stopped during {state.failure.stage}: {state.failure.message}"
+    if state.stop_reason == "coverage":
+        if state.report_status in {"incomplete", "best_effort_assembled"}:
+            return "Evidence coverage was reached, but report generation or validation did not finish successfully."
+        if state.warnings:
+            return "Evidence coverage was reached with limitations; some research steps required recovery or could not finish."
+        return "Research completed with sufficient evidence coverage."
+    if state.stop_reason == "round_limit":
+        return "The research round limit was reached before all evidence requirements were covered."
+    if state.stop_reason == "budget":
+        return "A research time, request, token, or cost limit was reached before the full plan finished."
+    if state.stop_reason == "no_tasks":
+        if hasattr(state.plan, "research_requirements") and state.judge is None:
+            return "Evidence evaluation did not finish, so sufficient coverage could not be confirmed."
+        if state.judge and state.judge.decision == "INSUFFICIENT_EVIDENCE":
+            return "The evidence evaluation found insufficient support to complete the research plan."
+        return "Research ended without sufficient coverage because no useful follow-up searches remained."
+    return "Research stopped before the full plan finished."
 
 
 def _exceptions(exc: BaseException):
@@ -91,8 +122,17 @@ def _exceptions(exc: BaseException):
 def failure_from_exception(exc: BaseException, *, provider: str, stage: str,
                            operation: str, call_id: int | None = None,
                            finish_reason: str | None = None) -> FailureDiagnostic:
-    if isinstance(exc, DiagnosticError) and exc.diagnostic is not None:
-        return exc.diagnostic.model_copy(update={"stage": stage})
+    original = getattr(exc, "research_diagnostic", None)
+    if original is None and isinstance(exc, DiagnosticError):
+        original = exc.diagnostic
+    if original is not None:
+        # A wrapper describes a consequence, not a new provider failure. Keep
+        # the original transport phase and correlation metadata intact.
+        if (stage, operation) == (original.stage, original.operation):
+            return original.model_copy()
+        effect = f"{stage} / {operation}"
+        return original.model_copy(update={"origin": "downstream",
+            "downstream_effects": list(dict.fromkeys([*original.downstream_effects, effect]))})
     chain = list(_exceptions(exc))
     category = "unexpected_error"
     selected = exc
@@ -153,10 +193,29 @@ def failure_from_exception(exc: BaseException, *, provider: str, stage: str,
                 break
         if category == "unexpected_error" and isinstance(exc, DiagnosticError) and exc.category in MESSAGES:
             selected, category = exc, exc.category
+    provider_code = None
+    if status is not None:
+        try:
+            body = selected.response.json()
+            error = body.get("error", body) if isinstance(body, dict) else {}
+            candidate = error.get("code") if isinstance(error, dict) else None
+            if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", candidate):
+                provider_code = candidate
+        except (ValueError, AttributeError, httpx.ResponseNotRead):
+            pass
+    confirmed = category in {"validation_error", "output_limit", "empty_response", "evidence_reference", "input_budget", "time_budget", "call_budget", "token_budget", "cost_budget"}
+    cause = MESSAGES[category] if confirmed else "Unknown"
+    confidence = "confirmed" if confirmed else "unknown"
+    if status == 429 and category == "rate_limit":
+        cause, confidence = "The provider rejected the request with HTTP 429 (rate limit).", "confirmed"
+    elif category == "context_overflow" and status is not None:
+        cause, confidence = "The provider reported that the context length was exceeded.", "confirmed"
+    elif status is not None:
+        cause, confidence = MESSAGES[category], "suspected"
     return FailureDiagnostic(
         provider=provider, stage=stage, operation=operation, category=category,
         exception_type=type(selected).__name__, message=MESSAGES[category],
-        http_status=status, request_id=request_id, call_id=call_id, retry_after_seconds=retry_after_seconds,
+        http_status=status, request_id=request_id, call_id=call_id, provider_code=provider_code, root_cause=cause, cause_confidence=confidence, retry_after_seconds=retry_after_seconds,
         finish_reason=finish_reason if finish_reason in {"stop", "length", "content_filter", "tool_calls", "function_call"} else None,
     )
 
@@ -172,7 +231,11 @@ def run_metadata(config) -> dict:
             proxies.append({"scheme": scheme, "host": parsed.hostname, "port": parsed.port})
         except ValueError:
             proxies.append({"scheme": scheme, "configured": True})
-    return {"kind": "run_start", "provider": config.provider, "model": config.model, "pricing": pricing_metadata(config),
+    options = inference_options(config)
+    context_limit, output_limit = model_limits(config)
+    return {"kind": "run_start", "reasoning_effort": options.get("reasoning_effort"),
+            "thinking_enabled": options.get("extra_body", {}).get("enable_thinking"),
+            "context_tokens": context_limit, "model_output_tokens": output_limit, "provider": config.provider, "model": config.model, "pricing": pricing_metadata(config),
             "kimi_host": urlsplit(config.kimi_base_url).hostname if config.provider == "kimi" else None,
             "model_host": urlsplit(config.base_url).hostname,
             "tavily_host": urlsplit(config.tavily_mcp_url).hostname,
@@ -186,7 +249,7 @@ class DiagnosticJournal:
     """Append one JSON object per event; intentionally exclude trace content."""
 
     FIELDS = {
-        "kind", "type", "stage", "provider", "operation", "call_id", "schema", "model",
+        "kind", "type", "stage", "status", "reasoning_effort", "thinking_enabled", "context_tokens", "model_output_tokens", "provider", "operation", "call_id", "schema", "model",
         "sequence", "elapsed_seconds", "duration_seconds", "time_to_first_delta_seconds",
         "timeout_seconds", "max_output_tokens", "tokens", "input_tokens", "output_tokens",
         "reasoning_tokens", "usage_observed", "finish_reason", "output_chars", "reasoning_chars",
@@ -197,6 +260,7 @@ class DiagnosticJournal:
         "research_id", "invocation_id", "query_ref", "retry_delay_seconds", "next_attempt", "category", "recovered", "fallback_required", "retryable",
         "session_id", "evidence_version", "snapshot_sha256", "query_count", "attempt", "query_id",
         "finding_count", "refinement_rounds", "total_cost_usd", "cost_complete", "token_usage_complete",
+        "error_id", "timestamp", "severity", "resolution", "parent_id", "span_id", "task_id", "recovery", "outcome", "decision", "scores", "overall_score", "rejection_reasons", "confidence", "quality_status",
         "report_status", "citation_validation_status", "coverage_score", "evidence_score", "reliability_score",
     }
 
@@ -221,3 +285,61 @@ class DiagnosticJournal:
             self.failed = True
             return False
         return True
+
+
+class ErrorHistory:
+    """Session-scoped logical issues; retries update one record and preserve history."""
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.issues = {}
+
+    def observe(self, event):
+        if event.get("type") == "diagnostic":
+            return None
+        diagnostic = event.get("diagnostic") or event.get("failure")
+        identity = event.get("invocation_id") or (diagnostic or {}).get("correlation_id") or event.get("span_id")
+        if identity is None and diagnostic:
+            identity = event.get("call_id") or event.get("search_id") or event.get("query_id") or diagnostic.get("call_id")
+            identity = identity or f"{diagnostic.get('provider')}:{diagnostic.get('stage')}:{diagnostic.get('operation')}"
+        if identity is None:
+            return None
+        error_id = hashlib.sha256(f"{self.run_id}:{identity}".encode()).hexdigest()[:24]
+        previous = self.issues.get(error_id)
+        kind = event.get("kind", "")
+        if diagnostic is None and (previous is None or kind not in {
+                "llm_start", "search_start", "llm_retry", "llm_continuation", "search_retry",
+                "llm_recovered", "search_recovered", "llm_complete", "search_complete", "search_degraded"}):
+            return None
+        now = event.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        record = {**(previous or {}), "error_id": error_id, "timestamp": previous.get("timestamp", now) if previous else now,
+                  "updated_at": now, "invocation_id": identity,
+                  "attempt": max(event.get("next_attempt") or event.get("attempt") or 1, (previous or {}).get("attempt", 1))}
+        for key in ("call_id", "span_id", "search_id", "query_id", "stage", "schema", "parent_id"):
+            if key in event:
+                record[key] = event[key]
+        if diagnostic:
+            if diagnostic.get("downstream_effects"):
+                record["downstream_effects"] = list(dict.fromkeys([
+                    *record.get("downstream_effects", []), *diagnostic["downstream_effects"]]))
+            if not previous or diagnostic.get("origin") != "downstream":
+                record.update(diagnostic=diagnostic)
+            record.update(severity="warning", resolution="active")
+        if kind in {"llm_retry", "llm_continuation", "search_retry"}:
+            record.update(resolution="retrying", recovery=event.get("recovery") or (
+                "Continuing from the saved output checkpoint." if kind == "llm_continuation"
+                else f"Retrying after {event.get('retry_delay_seconds', 0):g} seconds within the configured limit."))
+        if event.get("recovered") or kind in {"llm_recovered", "search_recovered", "llm_complete", "search_complete"}:
+            record.update(resolution="recovered", recovery=event.get("recovery") or "A subsequent attempt succeeded.", outcome="Recovered")
+        elif event.get("fallback_required"):
+            record.update(resolution="unrecovered", recovery=event.get("recovery") or "Continuing with the available evidence.", outcome="Partial recovery")
+        if event.get("type") == "error" or (event.get("type") == "result" and event.get("status") == "FAILED"):
+            record.update(severity="fatal", resolution="failed", outcome="Research cannot continue")
+        record["recovered"] = record.get("resolution") == "recovered"
+        if previous and {k: v for k, v in record.items() if k != "updated_at"} == {k: v for k, v in previous.items() if k != "updated_at"}:
+            return None
+        self.issues[error_id] = record
+        return {"type": "diagnostic", **record}
+
+
+def safe_request_id(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) else None

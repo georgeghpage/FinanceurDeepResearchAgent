@@ -41,7 +41,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 backend = BarrierBackend(failed)
                 state, report = await ResearchAgent(
                     backend,
-                    Config(session_dir=root),
+                    Config(session_dir=root, search_requests_per_second=10000),
                     SearchRouter(FakeAsyncSearch(delay=0)),
                     judge=FakeJudge(),
                 ).arun("facts")
@@ -79,13 +79,16 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 question = f"Isolated question {index}"
                 return await ResearchAgent(
                     BarrierBackend(),
-                    Config(session_dir=root),
+                    Config(session_dir=root, search_requests_per_second=10000),
                     SearchRouter(FakeAsyncSearch(delay=0)),
                     judge=FakeJudge(),
                 ).arun(question)
 
             results = await asyncio.wait_for(
-                asyncio.gather(*(run(i) for i in range(5))), 10
+                # This is a deadlock guard, not a production latency target;
+                # coverage plus five concurrent fsync-heavy stores adds overhead.
+                asyncio.gather(*(run(i) for i in range(5))),
+                30,
             )
             self.assertEqual(len({s.session_id for s, _ in results}), 5)
             for index, (state, report) in enumerate(results):
@@ -155,6 +158,16 @@ class ModelRecoveryTests(unittest.TestCase):
             response = next(replies)
             if isinstance(response, Exception):
                 raise response
+            if requests[-1].get("stream") and response.status_code == 200:
+                data = response.json()
+                data["object"] = "chat.completion.chunk"
+                for choice in data["choices"]:
+                    choice["delta"] = choice.pop("message")
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/event-stream"},
+                    text="data: " + json.dumps(data) + "\n\ndata: [DONE]\n\n",
+                )
             return response
 
         backend = AliyunBackend(
@@ -185,14 +198,15 @@ class ModelRecoveryTests(unittest.TestCase):
             headers=headers,
         )
 
-    def test_default_max_reasoning_and_bounded_json_continuation_preserve_content(self):
+    def test_opt_in_bounded_json_continuation_preserves_content(self):
         from deepsearchagent.models import ResearchPlan
 
         stage, backend, budget, events, requests = self.setup_transport(
             [
                 self.response('{"objective":"Checkpoint with citation F1",', "length"),
                 self.response('"tasks":[]}'),
-            ]
+            ],
+            max_continuations=2,
         )
         checkpoints = []
         budget.checkpoint = lambda *args: checkpoints.append(args)
@@ -200,7 +214,7 @@ class ModelRecoveryTests(unittest.TestCase):
         self.assertEqual(result.objective, "Checkpoint with citation F1")
         self.assertEqual(requests[0]["model"], "deepseek-v4.1-flash")
         self.assertTrue(requests[0]["enable_thinking"])
-        self.assertEqual(requests[0]["reasoning_effort"], "max")
+        self.assertEqual(requests[0]["reasoning_effort"], "low")
         self.assertNotIn("thinking_budget", requests[0])
         self.assertEqual(requests[1]["max_tokens"], 2000)
         self.assertNotIn("response_format", requests[1])
@@ -215,7 +229,7 @@ class ModelRecoveryTests(unittest.TestCase):
         self.assertIn("llm_recovered", [e["kind"] for e in events])
         self.assertNotIn("Checkpoint with citation F1", str(events))
 
-    def test_reasoning_only_truncation_grows_allocation_and_exhaustion_is_incomplete(
+    def test_reasoning_only_truncation_does_not_restart_or_grow_allocation(
         self,
     ):
         from deepsearchagent.models import ResearchPlan
@@ -230,8 +244,8 @@ class ModelRecoveryTests(unittest.TestCase):
         )
         with self.assertRaises(IncompleteResponse):
             stage.structured(ResearchPlan, "Plan", "Question")
-        self.assertEqual([r["max_tokens"] for r in requests], [1000, 2000, 4000])
-        self.assertEqual(budget.calls, 3)
+        self.assertEqual([r["max_tokens"] for r in requests], [1000])
+        self.assertEqual(budget.calls, 1)
         self.assertEqual(budget.pending_tokens, 0)
 
     def test_valid_json_with_length_is_never_silently_accepted(self):
@@ -246,11 +260,31 @@ class ModelRecoveryTests(unittest.TestCase):
             stage.structured(ResearchPlan, "Plan", "Question")
         self.assertEqual(budget.calls, 1)
 
+    def test_query_thinking_override_is_serialized_and_does_not_leak(self):
+        from deepsearchagent.budget import StageBackend
+        from deepsearchagent.models import ResearchPlan
+
+        _, backend, budget, _, requests = self.setup_transport(
+            [
+                self.response('{"objective":"Queries","tasks":[]}'),
+                self.response('{"objective":"Analysis","tasks":[]}'),
+            ],
+            reasoning_effort="max",
+        )
+        queries = StageBackend(backend, budget, 1000, 12000, thinking_enabled=False)
+        analysis = StageBackend(backend, budget, 1000, 12000)
+        queries.structured(ResearchPlan, "Queries only", "Question")
+        analysis.structured(ResearchPlan, "Analyze", "Evidence")
+        self.assertFalse(requests[0]["enable_thinking"])
+        self.assertNotIn("reasoning_effort", requests[0])
+        self.assertTrue(requests[1]["enable_thinking"])
+        self.assertEqual(requests[1]["reasoning_effort"], "max")
+
     def test_transient_retries_count_all_attempts_terminal_failures_stop(self):
         from openai import APIStatusError
         from deepsearchagent.models import ResearchPlan
 
-        for status, attempts in ((429, 2), (408, 2), (503, 2), (401, 1), (400, 1)):
+        for status, attempts in ((429, 2), (408, 1), (503, 2), (401, 1), (400, 1)):
             with self.subTest(status=status):
                 stage, _, budget, events, requests = self.setup_transport(
                     [
@@ -295,7 +329,7 @@ class ModelRecoveryTests(unittest.TestCase):
             self.assertEqual(requests, [])
             self.assertEqual(budget.pending_tokens, 0)
 
-    def test_default_classifier_uses_the_same_model_and_recovery_budget(self):
+    def test_optional_research_classifier_uses_the_same_model_and_recovery_budget(self):
         from deepsearchagent.models import JudgeDecision
 
         class DefaultJudgeBackend(AutoBackend):
@@ -315,21 +349,23 @@ class ModelRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             agent = ResearchAgent(
                 DefaultJudgeBackend(),
-                Config(session_dir=root),
+                Config(session_dir=root, judge_provider="research"),
                 SearchRouter(FakeAsyncSearch(delay=0)),
             )
             state, _ = agent.run("Facts")
             self.assertEqual(state.status, "COMPLETE", state.warnings)
             self.assertEqual(agent.judge.provider, "aliyun")
             self.assertEqual(agent.judge.model, "deepseek-v4.1-flash")
-            self.assertEqual(state.api_calls, 7)
+            self.assertEqual(state.api_calls, 9)
 
     def test_stream_interrupt_resumes_json_without_replaying_work(self):
         from unittest.mock import Mock
         from deepsearchagent.models import ResearchPlan
         from test_streaming import chunk
 
-        stage, backend, budget, events, _ = self.setup_transport([])
+        stage, backend, budget, events, _ = self.setup_transport(
+            [], max_continuations=2
+        )
         backend.trace = events.append
         first, second = Mock(), Mock()
         first.__iter__ = Mock(
@@ -372,7 +408,7 @@ class ModelRecoveryTests(unittest.TestCase):
             ).run("Facts")
             self.assertEqual(len(state.findings), 3)
             self.assertEqual(state.status, "PARTIAL")
-            self.assertIn("truncated", report)
+            self.assertIn("Some sources have not been fully assessed", report)
             self.assertIn("[S", report)
             files = list(Path(state.facts_path).parent.glob("generation-*.json"))
             self.assertEqual(len(files), 3)

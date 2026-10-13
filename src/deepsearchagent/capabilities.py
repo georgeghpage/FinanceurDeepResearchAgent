@@ -21,6 +21,10 @@ class ModelCapabilities:
 def capabilities(provider: str, model: str) -> ModelCapabilities:
     if provider == "aliyun" and model == "deepseek-v4.1-flash":
         return ModelCapabilities(1_000_000, 393_216, True, ("low", "high", "max"), True, True)
+    # Aliyun model-detail and structured-output docs verified 2026-10-13.
+    # Use only verified JSON/context limits; inference switches remain omitted.
+    if provider == "aliyun" and model in {"qwen3.8-flash", "qwen3.8-max", "qwen3.7-plus"}:
+        return ModelCapabilities(1_000_000, 131_072, True)
     if provider == "kimi" and (model.startswith("kimi-k3") or model in {"kimi-k2.6", "kimi-k2.5", "kimi-k2"}):
         return ModelCapabilities(262_144, 32_768, True,
                                  ("low", "high", "max") if model.startswith("kimi-k3") else ())
@@ -29,16 +33,21 @@ def capabilities(provider: str, model: str) -> ModelCapabilities:
     return ModelCapabilities()
 
 
-def inference_options(config) -> dict:
+def inference_options(config, *, thinking_enabled=None, reasoning_effort=None) -> dict:
     caps = capabilities(config.provider, config.model)
     effort = config.kimi_reasoning_effort if config.provider == "kimi" else config.reasoning_effort
+    if reasoning_effort is not None:
+        effort = reasoning_effort
+    if thinking_enabled is False and not caps.thinking_switch and caps.reasoning_efforts:
+        effort = "low"
     options = {}
     if caps.reasoning_efforts:
         if effort not in caps.reasoning_efforts:
             raise ValueError("Reasoning effort is unsupported by the selected model.")
         options["reasoning_effort"] = effort
     if caps.thinking_switch:
-        options["extra_body"] = {"enable_thinking": caps.thinking_default and config.thinking_enabled}
+        enabled = config.thinking_enabled if thinking_enabled is None else thinking_enabled
+        options["extra_body"] = {"enable_thinking": caps.thinking_default and enabled}
         if not options["extra_body"]["enable_thinking"]:
             options.pop("reasoning_effort", None)
     return options

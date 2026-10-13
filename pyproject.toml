@@ -1,7 +1,7 @@
 [project]
 name = "deepsearchagent"
 version = "0.1.0"
-description = "Bounded asynchronous multi-agent research with PAI evidence classification"
+description = "Bounded asynchronous research with relevance-focused answer evaluation"
 readme = "README.md"
 authors = [
     { name = "W3k01", email = "86103882+W3k01@users.noreply.github.com" }

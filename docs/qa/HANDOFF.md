@@ -1,3 +1,13 @@
+# Latest continuation — 2026-10-13
+
+The user's request to continue has been carried through the research/report upgrade. Use [IMPLEMENTATION_PROGRESS.md](../IMPLEMENTATION_PROGRESS.md) for the current changes and verification, and [WRITER_EVALUATION.md](../WRITER_EVALUATION.md) for backend-only model configuration and the evidence-frozen comparison tool.
+
+Latest results: full backend **254 tests, 251 passed, three live skips, no failures/errors**; full three-engine browser matrix **84 passed** plus **six final autosave/conflict checks**; visual **16 cases / 17 PNGs passed** without baseline updates; scoped QA checks and wheel asset verification passed. No live providers were called. Orchestration branch coverage is **86.620%**, below the existing 95% release gate; production readiness and model superiority remain unestablished. The temporary debug server was stopped, existing user changes were preserved, and no commit/deployment was made.
+
+The rest of this handoff is historical QA evidence from 2026-10-12. It does not describe the current editor or test inventory.
+
+---
+
 # Continuation update — 2026-10-12
 
 The user explicitly asked to check this handoff and continue development. That request supersedes the historical stop below. The remainder of this file preserves the original unfinished snapshot; use [TESTING.md](TESTING.md), [MATRIX.md](MATRIX.md), [DEFECTS.md](DEFECTS.md) and [READINESS.md](READINESS.md) for the current implementation and results.

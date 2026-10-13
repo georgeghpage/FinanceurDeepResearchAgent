@@ -25,9 +25,15 @@ from deepsearchagent.judge import (
 )
 from deepsearchagent.llm import BudgetExceeded, ResponseError
 from deepsearchagent.models import (
+    QualityEvaluation,
+    QualityScores,
+    AnswerRequirement,
     EvidenceExtraction,
     EvidenceFinding,
     EvidencePlan,
+    PlanningBrief,
+    QueryBatch,
+    QuerySpec,
     Finding,
     JudgeDecision,
     ParagraphAudit,
@@ -134,12 +140,19 @@ class AutoBackend:
         self.lock = threading.Lock()
         self.local = threading.local()
         self.extractions = self.active = self.peak = 0
+        self.extraction_barrier = None
         self.limits = []
         self.wrong_excerpt, self.unsupported_report, self.audit_reject = (
             wrong_excerpt,
             unsupported_report,
             audit_reject,
         )
+
+    def for_model(self, model, provider=None):
+        return self
+
+    def close_stream(self):
+        pass
 
     def usage_for_thread(self):
         return self.local.usage
@@ -156,6 +169,19 @@ class AutoBackend:
             "input_tokens": 80,
             "output_tokens": 20,
         }
+        if schema is PlanningBrief:
+            return PlanningBrief(
+                objective="Establish facts",
+                steps=["Find primary evidence for each fact."],
+                research_requirements=plan().research_requirements,
+            )
+        if schema is QueryBatch:
+            return QueryBatch(
+                queries=[
+                    QuerySpec(query=q.query, requirement_ids=q.requirement_ids)
+                    for q in plan().search_queries
+                ]
+            )
         if schema is EvidencePlan:
             return plan()
         if schema is EvidenceExtraction:
@@ -164,6 +190,8 @@ class AutoBackend:
                 self.active += 1
                 self.peak = max(self.peak, self.active)
             try:
+                if self.extraction_barrier is not None:
+                    self.extraction_barrier.wait(timeout=5)
                 time.sleep(0.02)
                 findings = []
                 for requirement in data["requirements"]:
@@ -191,6 +219,14 @@ class AutoBackend:
             finally:
                 with self.lock:
                     self.active -= 1
+        if schema is QualityEvaluation:
+            return FakeJudge().evaluate_answer(
+                data["original_query"],
+                plan().research_requirements,
+                data["final_answer"],
+                data["evidence"],
+                data["research_completion"],
+            )
         if schema is ReportDraft:
             findings = data["evidence"]["findings"]
             return ReportDraft(
@@ -286,4 +322,47 @@ class FakeJudge:
             contradictions=[],
             suggested_queries=self.queries if decision == "RESEARCH_MORE" else [],
             reason="Requirement-level evaluation",
+        )
+
+    def evaluate_answer(self, question, requirements, answer, evidence, research_state):
+        # Offline boundary fixture; dedicated quality tests cover rejected decisions.
+        self.usage = {
+            "usage_observed": True,
+            "tokens": 100,
+            "input_tokens": 80,
+            "output_tokens": 20,
+        }
+        return QualityEvaluation(
+            decision="PASS",
+            scores=QualityScores(**{key: 5 for key in QualityScores.model_fields}),
+            overall_score=5,
+            requirements_coverage=[
+                AnswerRequirement(
+                    requirement_id=r.id,
+                    status="COVERED",
+                    assessment="Cited evidence in answer",
+                    supporting_claim_ids=[
+                        f["id"]
+                        for f in evidence["findings"]
+                        if f["requirement_id"] == r.id
+                    ],
+                    supporting_source_ids=list(
+                        dict.fromkeys(
+                            f["source_id"]
+                            for f in evidence["findings"]
+                            if f["requirement_id"] == r.id
+                        )
+                    ),
+                )
+                for r in requirements
+            ],
+            missing_requirements=[],
+            unsupported_claims=[],
+            citation_issues=[],
+            irrelevant_content=[],
+            critical_issues=[],
+            actionable_feedback=[],
+            recommended_next_action="Finalize",
+            confidence=0.9,
+            suggested_queries=[],
         )

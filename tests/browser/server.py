@@ -13,8 +13,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "tests")]
 from deepsearchagent.config import Config
-from deepsearchagent.llm import ResponseError
-from deepsearchagent.models import EvidencePlan, EvidenceExtraction, ReportDraft
+from deepsearchagent.llm import IncompleteResponse, ResponseError
+from deepsearchagent.models import (
+    PlanningBrief,
+    QueryBatch,
+    EvidenceExtraction,
+    ReportDraft,
+)
 from deepsearchagent.orchestrator import ResearchAgent
 from deepsearchagent.ui import ResearchHandler, ResearchServer
 from deepsearchagent.tools.search import SearchError
@@ -43,6 +48,23 @@ class MemoryHistory:
     def __init__(self):
         self.lock = threading.RLock()
         self.chats = {}
+        self.documents = {}
+
+    def get_document(self, identifier):
+        with self.lock:
+            return self.documents.get(identifier)
+
+    def save_document(self, identifier, content, markdown, revision):
+        with self.lock:
+            previous = self.documents.get(identifier)
+            if (previous["revision"] if previous else 0) != revision:
+                return None
+            self.documents[identifier] = {
+                "content": content,
+                "markdown": markdown,
+                "revision": revision + 1,
+            }
+            return {"revision": revision + 1}
 
     def create(self, identifier, question):
         with self.lock:
@@ -101,18 +123,19 @@ class BrowserBackend(AutoBackend):
         wait_stage(
             question,
             {
-                EvidencePlan: "plan",
+                PlanningBrief: "plan",
+                QueryBatch: "plan",
                 EvidenceExtraction: "extract",
                 ReportDraft: "write",
             }.get(schema, "audit"),
         )
-        if schema is EvidencePlan and "[failure]" in question:
+        if schema is PlanningBrief and "[failure]" in question:
             raise ResponseError(
                 "CANARY-INTERNAL-SECRET", category="provider_unavailable"
             )
         result = super().structured(schema, instructions, payload, **options)
-        if schema is EvidencePlan:
-            for query in result.search_queries:
+        if schema is QueryBatch:
+            for query in result.queries:
                 query.query = question[:100] + " | " + query.query
         if schema is ReportDraft and "[long]" in question:
             from deepsearchagent.models import ReportSection
@@ -127,6 +150,20 @@ class BrowserBackend(AutoBackend):
                 )
                 for i in range(3)
             ]
+        if schema is ReportDraft and "[media]" in question:
+            result.sections[0].paragraphs[0].text += (
+                "\n\n```math\nx = 42\n```\n\n```chart\n"
+                '{"title":"Evidence comparison","values":[{"label":"Primary","value":42},'
+                '{"label":"Comparison","value":42}]}\n```'
+            )
+        if schema is ReportDraft and any(
+            tag in question for tag in ("[pause:preview]", "[interrupted]")
+        ):
+            content = result.model_dump_json()
+            options["on_partial"](content)
+            wait_stage(question, "preview")
+            if "[interrupted]" in question:
+                raise IncompleteResponse(content[:-2])
         return result
 
 

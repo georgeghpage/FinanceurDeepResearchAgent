@@ -3,6 +3,7 @@
 import argparse
 import json
 import threading
+from datetime import datetime, timezone
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,7 +12,7 @@ from uuid import UUID, uuid4
 
 from .cancellation import Cancellation
 from .config import Config, require_api_key, require_tavily_key
-from .diagnostics import DiagnosticJournal, failure_from_exception, run_metadata
+from .diagnostics import DiagnosticError, ErrorHistory, DiagnosticJournal, failure_from_exception, research_outcome, run_metadata
 from .history import ChatStore, database_url
 from .llm import AliyunBackend, KimiBackend
 from .model_catalog import list_models
@@ -35,6 +36,8 @@ class ResearchRun:
         self.question = question
         self.started = time.monotonic()
         self.events: list[dict] = []
+        self.issues: list[dict] = []
+        self.error_history = ErrorHistory(run_id)
         self.progress = ResearchProgress()
         self.done = False
         self.terminal = False
@@ -45,6 +48,7 @@ class ResearchRun:
         self.logging_failed = False
         self.store = store
         self.history_failed = False
+        self.history_warning_emitted = False
 
     def emit(self, event: dict) -> None:
         with self.condition:
@@ -54,14 +58,24 @@ class ResearchRun:
                 return
             saved = {**event, "run_id": self.id,
                                 "sequence": len(self.events) + 1,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "elapsed_seconds": event.get(
                                     "elapsed_seconds", round(time.monotonic() - self.started, 3))}
+            terminal = event.get("type") in {"result", "error"}
+            if terminal:
+                update = self.error_history.observe(saved)
+                if update:
+                    self.emit(update)
+                    saved["sequence"] = len(self.events) + 1
+                if event.get("type") == "result":
+                    saved["issues"] = list(self.error_history.issues.values())
             if self.journal and not self.journal.record(saved) and not self.logging_failed:
                 self.logging_failed = True
                 # Keep research running even when the log directory is unwritable.
-                self.events.append({"type": "trace", "kind": "logging_error", "run_id": self.id,
-                                    "sequence": len(self.events) + 1,
-                                    "message": "Could not save the diagnostic log. Save trace remains available."})
+                self.emit({"type": "trace", "kind": "logging_error", "invocation_id": "diagnostic-storage",
+                           "diagnostic": failure_from_exception(DiagnosticError("Storage failed", category="storage_error"),
+                               provider="application", stage="storage", operation="save_diagnostics").model_dump(),
+                           "message": "Could not save the diagnostic log. Save trace remains available."})
                 saved["sequence"] = len(self.events) + 1
             if self.store:
                 try:
@@ -70,7 +84,21 @@ class ResearchRun:
                     self.history_failed = True
                 if self.history_failed:
                     saved["history_error"] = "Some chat history could not be saved. Download this report and trace before leaving."
+                    if not self.history_warning_emitted:
+                        self.history_warning_emitted = True
+                        self.emit({"type": "trace", "kind": "history_error", "invocation_id": "history-storage",
+                                   "diagnostic": failure_from_exception(DiagnosticError("Storage failed", category="storage_error"),
+                                       provider="application", stage="storage", operation="save_history").model_dump(),
+                                   "message": saved["history_error"]})
+                        saved["sequence"] = len(self.events) + 1
+            if terminal and event.get("type") == "result":
+                saved["issues"] = list(self.error_history.issues.values())
             self.events.append(saved)
+            if not terminal:
+                update = self.error_history.observe(saved)
+                if update:
+                    self.emit(update)
+            self.issues = list(self.error_history.issues.values())
             if event.get("type") in {"result", "error"}:
                 self.terminal = True
             self.condition.notify_all()
@@ -143,7 +171,12 @@ class ResearchServer(ThreadingHTTPServer):
                           "tokens_used": state.tokens_used,
                           "session_id": state.session_id, "facts_path": state.facts_path,
                           "total_cost_usd": state.total_cost_usd, "cost_complete": state.cost_complete,
-                          "status": state.status, "report_status": state.report_status, "citation_validation_status": state.citation_validation_status,
+                          "status": state.status, "quality_status": state.quality_status, "quality_evaluation": state.quality_evaluation.model_dump() if state.quality_evaluation else None, "report_status": state.report_status, "citation_validation_status": state.citation_validation_status,
+                          "stop_explanation": research_outcome(state), "warnings": state.warnings,
+                          "unresolved": list(dict.fromkeys([*state.unresolved,
+                              *(state.judge.critical_gaps if state.judge else []),
+                              *(state.verification.gaps if state.verification else [])])),
+                          "issues": list(run.error_history.issues.values()),
                           "failure": state.failure.model_dump() if state.failure else None})
         except Exception as exc:
             diagnostic = failure_from_exception(exc, provider="agent", stage=agent.stage if agent else "initialize",
@@ -208,6 +241,20 @@ class ResearchHandler(BaseHTTPRequestHandler):
             self._json(403, "Open the UI using its localhost address.")
             return
         parsed = urlsplit(self.path)
+        if parsed.path.startswith("/api/documents/"):
+            try:
+                chat_id = str(UUID(parsed.path.removeprefix("/api/documents/")))
+                if self.server.store is None:
+                    self._json(503, "Server document storage unavailable; edits remain on this device.")
+                elif self.server.store.get(chat_id) is None:
+                    self._json(404, "Chat not found.")
+                else:
+                    self._json_body(200, {"document": self.server.store.get_document(chat_id)})
+            except ValueError:
+                self._json(400, "Invalid document ID.")
+            except Exception:
+                self._json(503, "Document storage unavailable; local edits are retained.")
+            return
         if parsed.path == "/api/models":
             provider = parse_qs(parsed.query, keep_blank_values=True).get("provider", ["aliyun"])[0]
             try:
@@ -311,6 +358,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
                                   "busy": self.server.run_lock.locked()})
             return
         files = {"/": ("index.html", "text/html; charset=utf-8"),
+                 "/editor.js": ("editor.js", "text/javascript; charset=utf-8"),
                  "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                  "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
                  "/style.css": ("style.css", "text/css; charset=utf-8")}
@@ -325,6 +373,33 @@ class ResearchHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._local_request():
             self._json(403, "Research requests must come from the local UI.")
+            return
+        if self.path.startswith("/api/documents/"):
+            try:
+                chat_id = str(UUID(self.path.removeprefix("/api/documents/")))
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 2_000_000:
+                    self._json(413, "Document exceeds the 2 MB save limit.")
+                    return
+                data = json.loads(self.rfile.read(length))
+                if (not isinstance(data, dict) or not isinstance(data.get("content"), dict)
+                        or data["content"].get("type") != "doc" or not isinstance(data.get("markdown"), str)
+                        or type(data.get("revision")) is not int or data["revision"] < 0):
+                    raise ValueError
+                if self.server.store is None:
+                    self._json(503, "Server document storage unavailable; edits remain on this device.")
+                elif self.server.store.get(chat_id) is None:
+                    self._json(404, "Chat not found.")
+                else:
+                    saved = self.server.store.save_document(chat_id, data["content"], data["markdown"], data["revision"])
+                    if saved is None:
+                        self._json(409, "A newer document is saved. Copy or export your edits before reloading.")
+                    else:
+                        self._json_body(200, saved)
+            except (ValueError, TypeError):
+                self._json(400, "Invalid document.")
+            except Exception:
+                self._json(503, "Document save unavailable; local edits are retained.")
             return
         if self.path.startswith("/api/research/") and self.path.endswith("/stop"):
             try:

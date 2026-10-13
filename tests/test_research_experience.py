@@ -228,14 +228,17 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(state.failure)
                 self.assertEqual(
                     state.status,
-                    "FAILED" if fail_all else "PARTIAL" if permanent else "COMPLETE",
+                    "FAILED" if fail_all else "COMPLETE",
                 )
                 self.assertNotIn("PRIVATE", report)
                 if permanent or fail_all:
-                    self.assertIn("Source coverage incomplete", report)
+                    self.assertTrue(
+                        any("Source coverage incomplete" in w for w in state.warnings)
+                    )
+                self.assertNotIn("Source coverage incomplete", report)
                 if fail_all:
                     self.assertEqual(state.sources, [])
-                    self.assertIn("No eligible source-backed evidence", report)
+                    self.assertIn("No source-backed evidence", report)
                 else:
                     self.assertTrue(state.sources)
                     self.assertTrue(state.findings)
@@ -293,7 +296,7 @@ class ProgressTests(unittest.TestCase):
             }
         )
         self.assertEqual(update["source_count"], 1)
-        self.assertEqual(progress.receive({"kind": "search_retry"})["code"], "retrying")
+        self.assertIsNone(progress.receive({"kind": "search_retry"}))
         progress.receive({"kind": "stage_start", "stage": "write"})
         self.assertIsNone(progress.receive({"kind": "search_retry"}))
         self.assertEqual(

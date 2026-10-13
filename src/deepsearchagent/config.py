@@ -26,10 +26,16 @@ def environment_values() -> dict[str, str]:
 class Config:
     provider: str = "aliyun"
     model: str = "deepseek-v4.1-flash"
+    research_model: str | None = None
+    final_writer_model: str | None = "qwen3.8-flash"
+    final_writer_provider: str = "aliyun"
+    final_writer_input_price_per_million: float | None = None
+    final_writer_output_price_per_million: float | None = None
+    search_requests_per_second: float = 5.0
     kimi_base_url: str = "https://api.moonshot.cn/v1"
     aliyun_base_url: str = "https://maas.qianwenaiapi.com/compatible-mode/v1"
     kimi_reasoning_effort: str = "low"
-    reasoning_effort: str = "max"
+    reasoning_effort: str = "low"
     thinking_enabled: bool = True
     context_tokens: int = 1_000_000
     model_output_tokens: int = 393_216
@@ -38,7 +44,7 @@ class Config:
     audit_output_tokens: int = 8_192
     llm_concurrency: int = 3
     llm_retries: int = 2
-    max_continuations: int = 2
+    max_continuations: int = 0
     llm_backoff: float = 1.0
     llm_max_delay: float = 20.0
     llm_jitter: float = 0.2
@@ -68,12 +74,12 @@ class Config:
     max_cost_usd: float | None = None
     session_dir: str = "reports/sessions"
     min_information_gain: int = 1
-    judge_provider: str = "research"
-    judge_base_url: str = "https://aiservice.cn-hangzhou.aliyuncs.com/v1"
-    judge_model: str = "pai-judge"
+    judge_provider: str = "aliyun"
+    judge_base_url: str | None = None
+    judge_model: str = "qwen3.8-max"
     judge_temperature: float = 0
     judge_output_tokens: int = 16_384
-    judge_input_tokens: int = 32_000
+    judge_input_tokens: int = 96_000
     judge_timeout: float = 60
     judge_retries: int = 1
     judge_json_mode: str = "json_object"
@@ -85,6 +91,10 @@ class Config:
     judge_output_price_per_million: float | None = None
     judge_fallback_input_price_per_million: float | None = None
     judge_fallback_output_price_per_million: float | None = None
+    quality_max_iterations: int = 2
+    quality_min_primary_score: float = 4
+    quality_min_grounding_score: float = 4
+    quality_min_overall_score: float = 4
     ready_coverage_threshold: float = 0.90
     tavily_mcp_url: str = "https://mcp.tavily.com/mcp/"
     # Optional account-specific USD rates; None uses a published reference rate.
@@ -95,8 +105,20 @@ class Config:
     tavily_price_per_search: float = 0.016
 
     def __post_init__(self) -> None:
+        if self.final_writer_provider not in {"aliyun", "kimi"}:
+            raise ValueError("Invalid final writer provider")
+        if not 0 <= self.quality_max_iterations <= 5:
+            raise ValueError("quality_max_iterations must be between zero and five")
+        for name in ("quality_min_primary_score", "quality_min_grounding_score", "quality_min_overall_score"):
+            if not math.isfinite(getattr(self, name)) or not 0 <= getattr(self, name) <= 5:
+                raise ValueError(f"{name} must be finite and between zero and five")
+        if self.research_model is not None:
+            object.__setattr__(self, "model", self.research_model)
+        if self.final_writer_model is not None and (not self.final_writer_model.strip() or len(self.final_writer_model) > 200 or any(c.isspace() for c in self.final_writer_model)):
+            raise ValueError("final_writer_model must be a valid model ID")
         for name in ("input_price_per_million", "output_price_per_million", "cached_price_per_million",
                      "cache_write_price_per_million", "tavily_price_per_search", "max_cost_usd",
+                     "final_writer_input_price_per_million", "final_writer_output_price_per_million",
                      "judge_input_price_per_million", "judge_output_price_per_million",
                      "judge_fallback_input_price_per_million", "judge_fallback_output_price_per_million"):
             value = getattr(self, name)
@@ -107,7 +129,7 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         if not 0 <= self.max_rounds <= 2:
             raise ValueError("max_rounds must be between zero and two additional rounds")
-        for name in ("max_seconds", "request_timeout"):
+        for name in ("max_seconds", "request_timeout", "search_requests_per_second"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive and finite")
         for name in ("search_concurrency", "researcher_input_tokens", "researcher_output_tokens",
@@ -188,16 +210,17 @@ class Config:
                      "llm_concurrency", "llm_retries", "max_continuations", "search_circuit_threshold",
                      "search_concurrency", "search_retries", "max_search_retries", "researcher_input_tokens", "researcher_output_tokens",
                      "writer_input_tokens", "writer_output_tokens", "writer_reserve_tokens", "judge_input_tokens",
-                     "judge_output_tokens", "judge_retries", "min_information_gain", "max_rounds", "max_tasks",
+                     "judge_output_tokens", "judge_retries", "quality_max_iterations", "min_information_gain", "max_rounds", "max_tasks",
                      "max_calls", "max_tokens", "max_searches", "max_output_tokens"):
             if name.upper() in env and overrides.get(name) is None:
                 values[name] = int(env[name.upper()])
         for name in ("llm_backoff", "llm_max_delay", "llm_jitter", "search_circuit_seconds", "max_cost_usd", "search_backoff", "search_backoff_multiplier", "search_max_delay", "search_jitter", "writer_reserve_seconds", "judge_timeout", "judge_temperature",
-                     "ready_coverage_threshold", "judge_input_price_per_million", "judge_output_price_per_million",
-                     "judge_fallback_input_price_per_million", "judge_fallback_output_price_per_million", "max_seconds", "request_timeout"):
+                     "ready_coverage_threshold", "quality_min_primary_score", "quality_min_grounding_score", "quality_min_overall_score", "final_writer_input_price_per_million", "final_writer_output_price_per_million",
+                     "judge_input_price_per_million", "judge_output_price_per_million",
+                     "judge_fallback_input_price_per_million", "judge_fallback_output_price_per_million", "max_seconds", "request_timeout", "search_requests_per_second"):
             if name.upper() in env and overrides.get(name) is None:
                 values[name] = float(env[name.upper()])
-        for name in ("reasoning_effort", "session_dir", "judge_provider", "judge_base_url", "judge_model", "judge_json_mode",
+        for name in ("research_model", "final_writer_model", "final_writer_provider", "reasoning_effort", "session_dir", "judge_provider", "judge_base_url", "judge_model", "judge_json_mode",
                      "judge_prompt_path", "judge_fallback_provider", "judge_fallback_model", "judge_fallback_base_url"):
             if env.get(name.upper()) and overrides.get(name) is None:
                 values[name] = env[name.upper()]

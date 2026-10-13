@@ -4,10 +4,12 @@ import threading
 import time
 import json
 import random
+from dataclasses import replace
 
 from .llm import BudgetExceeded, IncompleteResponse, continuation_payload
 from .capabilities import model_limits
-from .diagnostics import failure_from_exception
+from .diagnostics import CALL_CONTEXT, failure_from_exception
+from uuid import uuid4
 from .pricing import pricing_metadata
 
 def stage_prompt(instructions, schema):
@@ -56,7 +58,7 @@ class RunBudget:
             cost = (input_tokens * (rates[0] or 0) + output_tokens * (rates[1] or 0)) / 1_000_000
             if self.config.max_cost_usd is not None and not known:
                 raise BudgetExceeded("Configure input and output prices to enforce a monetary budget.", category="unpriced_model")
-            writer_cost = 0 if writing else reserve * max(rates[0] or 0, rates[1] or 0) / 1_000_000
+            writer_cost = self.writer_cost(reserve, rates)
             if self.config.max_cost_usd is not None and self.cost + self.pending_cost + cost + writer_cost > self.config.max_cost_usd:
                 raise BudgetExceeded("Model cost reservation would exceed budget.", category="cost_budget")
             self.calls += 1
@@ -64,6 +66,20 @@ class RunBudget:
             self.pending_cost += cost
             self.cost_complete &= known
             return count, cost, rates, input_tokens, output_tokens
+
+    def writer_cost(self, reserve, rates):
+        if not reserve:
+            return 0.0
+        if self.config.final_writer_model and self.config.final_writer_model != self.config.model:
+            config = replace(self.config, provider=self.config.final_writer_provider, model=self.config.final_writer_model, research_model=None,
+                             input_price_per_million=self.config.final_writer_input_price_per_million,
+                             output_price_per_million=self.config.final_writer_output_price_per_million,
+                             cached_price_per_million=None, cache_write_price_per_million=None)
+            prices = pricing_metadata(config)
+            rates = (prices["input_price_per_million"], prices["output_price_per_million"])
+            if self.config.max_cost_usd is not None and any(rate is None for rate in rates):
+                raise BudgetExceeded("Configure final writer prices to enforce a monetary budget.", category="unpriced_model")
+        return reserve * max(rates[0] or 0, rates[1] or 0) / 1_000_000
 
     def settle(self, reservation, usage):
         count, cost, rates, inp, out = reservation
@@ -86,7 +102,11 @@ class RunBudget:
             if self.searches >= self.config.max_searches:
                 raise BudgetExceeded("Search request budget reached.", category="search_budget")
             cost = self.config.tavily_price_per_search
-            if self.config.max_cost_usd is not None and self.cost + self.pending_cost + cost > self.config.max_cost_usd:
+            writer_cost = 0.0
+            if self.config.max_cost_usd is not None and self.config.final_writer_model and self.config.final_writer_model != self.config.model:
+                reserve = min(self.config.writer_reserve_tokens, self.config.max_tokens // 3)
+                writer_cost = self.writer_cost(reserve, (None, None))
+            if self.config.max_cost_usd is not None and self.cost + self.pending_cost + cost + writer_cost > self.config.max_cost_usd:
                 raise BudgetExceeded("Search cost budget reached.", category="cost_budget")
             self.searches += 1
             self.cost += cost
@@ -109,10 +129,20 @@ class RunBudget:
 
 
 class StageBackend:
-    def __init__(self, backend, budget, output_tokens, input_tokens, *, writing=False, timeout=None):
+    def __init__(self, backend, budget, output_tokens, input_tokens, *, writing=False, timeout=None,
+                 thinking_enabled=None, reasoning_effort=None, max_continuations=None, on_partial=None):
         self.backend, self.budget = backend, budget
         self.output_tokens, self.input_tokens, self.writing = output_tokens, input_tokens, writing
         self.timeout = timeout or budget.config.request_timeout
+        self.thinking_enabled, self.reasoning_effort = thinking_enabled, reasoning_effort
+        self.max_continuations = budget.config.max_continuations if max_continuations is None else max_continuations
+        self.partial_content = ""
+        self.on_partial = on_partial
+
+    def _partial(self, content):
+        self.partial_content = content
+        if self.on_partial:
+            self.on_partial(content)
 
     def _wait(self, delay, deadline):
         end = time.monotonic() + delay
@@ -129,17 +159,20 @@ class StageBackend:
             self.budget.remaining_time(self.writing)
             if time.monotonic() >= deadline:
                 raise BudgetExceeded("Model queue deadline reached.", category="request_timeout")
+        context = CALL_CONTEXT.set({**CALL_CONTEXT.get(), "invocation_id": uuid4().hex, "attempt": 1})
         try:
             return self._structured(schema, instructions, payload, deadline)
         finally:
+            CALL_CONTEXT.reset(context)
             self.budget.model_slots.release()
 
     def _structured(self, schema, instructions, payload, deadline):
         config = self.budget.config
         system = stage_prompt(instructions, schema)
-        prices = pricing_metadata(config)
+        model_config = getattr(self.backend, "config", config)
+        prices = pricing_metadata(model_config)
         rates = (prices["input_price_per_million"], prices["output_price_per_million"])
-        context_limit, output_limit = model_limits(config)
+        context_limit, output_limit = model_limits(model_config)
         allocation = min(self.output_tokens, output_limit)
         prefix = ""
         retries = continuations = 0
@@ -159,15 +192,21 @@ class StageBackend:
                 available = config.max_tokens - self.budget.tokens - self.budget.pending_tokens - reserve - count
                 output = min(allocation, available, context_limit - count)
                 if config.max_cost_usd is not None and rates[1]:
-                    writer_cost = reserve * max(rates[0] or 0, rates[1]) / 1_000_000
+                    writer_cost = self.budget.writer_cost(reserve, rates)
                     cost_left = config.max_cost_usd - self.budget.cost - self.budget.pending_cost - writer_cost - count * (rates[0] or 0) / 1_000_000
                     output = min(output, int(cost_left * 1_000_000 / rates[1]))
                 if output <= 0:
                     raise BudgetExceeded("No output allocation remains.", category="token_budget")
                 reservation = self.budget.reserve_model(count, output, rates, self.writing)
             kwargs = {"output_tokens": output, "timeout": remaining_time, "system_prompt": system}
+            kwargs["on_partial"] = self._partial
+            if self.thinking_enabled is not None:
+                kwargs["thinking_enabled"] = self.thinking_enabled
+            if self.reasoning_effort is not None:
+                kwargs["reasoning_effort"] = self.reasoning_effort
             if prefix:
                 kwargs["continuation"] = prefix
+            CALL_CONTEXT.set({**CALL_CONTEXT.get(), "attempt": retries + continuations + 1})
             try:
                 result = self.backend.structured(schema, instructions, payload, **kwargs)
                 self.budget.remaining_time(self.writing)
@@ -181,7 +220,7 @@ class StageBackend:
                 return result
             except Exception as exc:
                 error = exc
-                diagnostic = failure_from_exception(exc, provider=config.provider, stage="model", operation="recover")
+                diagnostic = failure_from_exception(exc, provider=model_config.provider, stage="model", operation="recover")
             finally:
                 try:
                     usage = self.backend.usage_for_thread() if hasattr(self.backend, "usage_for_thread") else {"usage_observed": False}
@@ -191,7 +230,8 @@ class StageBackend:
             if isinstance(error, IncompleteResponse):
                 if self.budget.checkpoint:
                     self.budget.checkpoint(schema.__name__, error.partial_content, False)
-                if continuations >= config.max_continuations:
+                self.partial_content = error.partial_content
+                if continuations >= self.max_continuations or not error.partial_content:
                     raise error
                 prefix = error.partial_content
                 continuations += 1
@@ -199,7 +239,7 @@ class StageBackend:
                 emit({"kind": "llm_continuation", "schema": schema.__name__, "category": diagnostic.category,
                       "attempt": continuations, "output_chars": len(prefix), "max_output_tokens": allocation})
                 continue
-            transient = {"rate_limit", "provider_unavailable", "timeout", "request_timeout", "connection_error",
+            transient = {"rate_limit", "provider_unavailable", "connection_error",
                          "protocol_error", "dns_error", "empty_response", "validation_error", "missing_finish"}
             if isinstance(error, BudgetExceeded) or diagnostic.category not in transient or retries >= config.llm_retries:
                 raise error

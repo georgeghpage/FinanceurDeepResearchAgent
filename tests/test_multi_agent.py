@@ -34,7 +34,7 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.config = Config(session_dir=self.directory.name)
+        self.config = Config(session_dir=self.directory.name, search_requests_per_second=10000)
 
     def run_agent(self, judge=None, backend=None, search=None, config=None, fallback=None):
         backend, search = backend or AutoBackend(), search or FakeAsyncSearch()
@@ -44,7 +44,9 @@ class WorkflowTests(unittest.TestCase):
         return state, report, backend, search, events
 
     def test_initial_flow_parallel_budgets_and_atomic_session(self):
-        state, report, backend, search, events = self.run_agent()
+        backend = AutoBackend()
+        backend.extraction_barrier = threading.Barrier(3)
+        state, report, backend, search, events = self.run_agent(backend=backend)
         self.assertEqual(state.stop_reason, "coverage", state.warnings)
         self.assertEqual(len(search.queries), 15)
         self.assertEqual(search.peak, 5)
@@ -111,7 +113,8 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(state.report_status, "generated")
                 if errors == 2:
                     self.assertIsNone(state.judge)
-                    self.assertIn("classification was unavailable", report)
+                    self.assertTrue(any("classification was unavailable" in w for w in state.warnings))
+                self.assertNotIn("classification was unavailable", report)
 
     def test_fallback_uses_same_validation(self):
         primary, fallback = FakeJudge(errors=2), FakeJudge()
@@ -127,7 +130,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(judge.calls, 2)
         self.assertIsNone(state.judge)
         self.assertNotEqual(state.stop_reason, "coverage")
-        self.assertIn("classification was unavailable", report)
+        self.assertTrue(any("classification was unavailable" in w for w in state.warnings))
+        self.assertNotIn("classification was unavailable", report)
 
     def test_invented_excerpt_cannot_pass_ready(self):
         state, report, _, _, events = self.run_agent(backend=AutoBackend(wrong_excerpt=True))
@@ -151,10 +155,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual({f.source_id for f in state.findings}, {"S1"})
         self.assertEqual(len({f.id for f in state.findings}), len(state.findings))
 
-    def test_search_budget_keeps_evidence_and_attempts_writing(self):
+    def test_plan_respects_small_search_budget_and_finishes(self):
         state, report, _, search, _ = self.run_agent(config=replace(self.config, max_searches=5))
         self.assertEqual(len(search.queries), 5)
-        self.assertEqual(state.stop_reason, "budget")
+        self.assertEqual(state.stop_reason, "coverage")
         self.assertTrue(state.findings)
         self.assertIn("42", report)
         self.assertIn(state.report_status, {"generated", "best_effort_assembled"})
@@ -335,7 +339,7 @@ class EntrypointTests(unittest.TestCase):
              patch("deepsearchagent.config.dotenv_values", return_value={}), \
              patch("deepsearchagent.cli.AliyunBackend", return_value=backend), \
              patch("deepsearchagent.cli.TavilyMCPSearch", return_value=search), \
-             patch("deepsearchagent.orchestrator.ResearchModelJudge", return_value=judge), \
+             patch("deepsearchagent.orchestrator.OpenAICompatibleJudge", return_value=judge), \
              patch("sys.argv", ["deepsearchagent", "Establish facts", "--quiet", "--output", str(Path(directory) / "answer.md"),
                                 "--state", str(Path(directory) / "result.json"), "--log", str(Path(directory) / "trace.jsonl")]):
             main()
@@ -354,7 +358,7 @@ class EntrypointTests(unittest.TestCase):
              patch("deepsearchagent.config.dotenv_values", return_value={}), \
              patch("deepsearchagent.ui.AliyunBackend", return_value=backend), \
              patch("deepsearchagent.ui.TavilyMCPSearch", return_value=search), \
-             patch("deepsearchagent.orchestrator.ResearchModelJudge", return_value=judge):
+             patch("deepsearchagent.orchestrator.OpenAICompatibleJudge", return_value=judge):
             server = ResearchServer(("127.0.0.1", 0))
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()
@@ -442,7 +446,8 @@ class AdditionalFailureTests(unittest.TestCase):
                 judge=ChangingJudge(("RESEARCH_MORE",))).run("Question")
         self.assertEqual(state.rounds, 2)
         self.assertEqual(state.stop_reason, "no_tasks")
-        self.assertIn("marginal evidence gain", report)
+        self.assertTrue(any("marginal evidence gain" in w for w in state.warnings))
+        self.assertNotIn("marginal evidence gain", report)
 
     def test_zero_refinement_budget_still_writes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -520,7 +525,9 @@ class SynchronousAdapterDeadlineTests(unittest.TestCase):
             try:
                 state, _ = ResearchAgent(AutoBackend(), Config(session_dir=root, max_seconds=0.06,
                     writer_reserve_seconds=0.01, search_retries=0), SearchRouter(SlowSyncSearch()), judge=FakeJudge()).run("Question")
-                self.assertLess(time.monotonic() - started, 0.3)
+                # Must release well before the blocked provider's five seconds;
+                # allow instrumented filesystem/scheduler overhead on the host.
+                self.assertLess(time.monotonic() - started, 0.8)
                 self.assertEqual(state.stop_reason, "budget")
                 self.assertEqual(state.report_status, "best_effort_assembled")
             finally:

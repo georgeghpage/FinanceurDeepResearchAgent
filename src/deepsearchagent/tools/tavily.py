@@ -106,7 +106,8 @@ class TavilyMCPSearch:
         from .retry import RetryPolicy
         policy = RetryPolicy(self.config)
         return await policy.run(lambda remaining, meta: self.asearch_once(query, timeout=remaining),
-                                timeout=timeout, provider="tavily", trace=self.trace,
+                                timeout=min(self.config.max_seconds, timeout * (self.config.search_retries + 1) + self.config.search_max_delay * self.config.search_retries),
+                                request_timeout=timeout, provider="tavily", trace=self.trace,
                                 context=SEARCH_CONTEXT.get(), cancellation=self.cancellation)
 
     def search(self, query: str, *, timeout: float) -> SearchResult:

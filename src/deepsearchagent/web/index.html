@@ -7,6 +7,7 @@
   <title>Deep Research</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/dashboard.js" defer></script>
+  <script src="/editor.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -19,7 +20,7 @@
   <main>
     <header>
       <div class="brand"><span class="brand-icon" aria-hidden="true">✳</span> Deep Research</div>
-      <span class="local">Local workspace</span>
+      <div class="header-status"><span class="local">Local workspace</span><button id="error-center-toggle" class="secondary" type="button" aria-label="Open Error Center" aria-haspopup="dialog">⚠ <span id="error-count" hidden>0</span></button></div>
     </header>
     <section id="intro" class="intro">
       <p class="eyebrow">A little curiosity goes a long way</p>
@@ -43,13 +44,43 @@
       <div class="trace-top"><h3>Research activity</h3><button id="download-trace" class="secondary" type="button">Save trace ↓</button></div>
       <div id="trace" class="trace" role="region" aria-label="Research activity history" tabindex="0"><ol id="events"></ol></div></details>
     </section>
-    <p id="error" class="error" role="alert" hidden></p>
+
     <section id="answer-section" class="answer-section" hidden aria-labelledby="answer-title">
       <div class="answer-top"><div><p class="eyebrow">The findings</p><h2 id="answer-title">Your answer</h2></div><button id="download" class="secondary" type="button">Save report ↓</button></div>
+      <p id="document-completeness" class="document-kicker">Research report</p>
+      <div id="document-tools" class="document-tools" hidden>
+        <div class="document-actions">
+          <button id="edit-toggle" type="button" class="secondary" aria-pressed="true">Reading view</button>
+          <button id="copy-report" type="button" class="secondary">Copy Markdown</button>
+          <button id="print-report" type="button" class="secondary">Print / PDF</button>
+          <span id="document-status" role="status" aria-live="polite"></span>
+        </div>
+        <div id="format-tools" class="format-tools" role="toolbar" aria-label="Document formatting">
+          <button type="button" data-editor-command="h2" aria-label="Heading 2">H2</button>
+          <button type="button" data-editor-command="h3" aria-label="Heading 3">H3</button>
+          <button type="button" data-editor-command="bold" aria-label="Bold (Ctrl or Command B)"><b>B</b></button>
+          <button type="button" data-editor-command="italic" aria-label="Italic (Ctrl or Command I)"><i>I</i></button>
+          <button type="button" data-editor-command="bullet">Bullets</button>
+          <button type="button" data-editor-command="ordered">Numbered</button>
+          <button type="button" data-editor-command="link">Link</button>
+          <button type="button" data-editor-command="code">Code</button>
+          <button type="button" data-editor-command="math">Formula</button>
+          <button type="button" data-editor-command="chart">Chart</button>
+          <button type="button" data-editor-command="table">Table</button>
+          <button type="button" data-editor-command="row">+ Row</button>
+          <button type="button" data-editor-command="column">+ Column</button>
+          <button type="button" data-editor-command="deleteTable">Delete table</button>
+          <button type="button" data-editor-command="undo" aria-label="Undo">↶</button>
+          <button type="button" data-editor-command="redo" aria-label="Redo">↷</button>
+        </div>
+      </div>
       <article id="answer"></article>
     </section>
     <footer>Thoughtful research. Sources you can follow.</footer>
   </main>
+  <div id="notification-toast" class="notification-toast" hidden role="status" aria-live="polite"><p id="error" hidden></p><div><button id="toast-view" class="secondary" type="button">Inspect issues</button><button id="toast-dismiss" class="secondary" type="button" aria-label="Dismiss notification">Dismiss</button></div></div>
+  <dialog id="error-center" class="error-center" aria-labelledby="error-center-title"><div class="error-center-heading"><div><p class="eyebrow">Session diagnostics</p><h2 id="error-center-title">Error Center</h2></div><button id="error-center-close" class="secondary" type="button" aria-label="Close Error Center">Close</button></div><p id="error-center-summary" role="status">No issues in this session.</p><section id="dashboard-issues" class="research-issues" hidden aria-labelledby="dashboard-issues-title"><h3 id="dashboard-issues-title">Research outcome & issues</h3><p id="dashboard-outcome"></p><ul id="dashboard-issue-list"></ul></section><p id="error-center-empty">Diagnostic history is retained even after notifications are dismissed.</p></dialog>
+  <dialog id="critical-error" class="critical-error" aria-labelledby="critical-error-title"><h2 id="critical-error-title">Research could not continue</h2><p id="critical-error-message"></p><p>Your available research and diagnostic history are retained.</p><div><button id="critical-inspect" type="button">Inspect failure</button><button id="critical-close" class="secondary" type="button">Close</button></div></dialog>
   <details id="diagnostics" class="diagnostics"><summary>Developer diagnostics</summary>
   <aside id="dashboard" class="dashboard" aria-label="Research tracing dashboard">
     <div class="dashboard-heading"><div><p class="eyebrow">Observability</p><h2>Run overview</h2></div><span id="dashboard-state" class="run-badge">Idle</span></div>

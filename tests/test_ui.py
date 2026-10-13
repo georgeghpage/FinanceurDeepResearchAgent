@@ -19,6 +19,23 @@ from test_agent import FakeSearch, ScriptedBackend, TASK, draft, extraction, ver
 from test_streaming import chunk
 
 
+class RunIssueTests(unittest.TestCase):
+    def test_search_recovery_preserves_cause_and_only_updates_its_own_invocation(self):
+        run = ResearchRun(str(uuid4()), "Facts")
+        diagnostic = {"provider": "tavily", "stage": "search", "operation": "search",
+                      "category": "timeout", "message": "Provider request timed out."}
+        for search_id in (1, 2):
+            run.emit({"type": "trace", "kind": "search_error", "search_id": search_id,
+                      "invocation_id": f"search-{search_id}", "diagnostic": diagnostic})
+        run.emit({"type": "trace", "kind": "search_recovered", "invocation_id": "search-1"})
+        self.assertTrue(run.issues[0]["recovered"])
+        self.assertFalse(run.issues[1]["recovered"])
+        self.assertEqual(run.issues[0]["diagnostic"]["category"], "timeout")
+        run.emit({"type": "trace", "kind": "planning_recovered", "schema": "PlanningBrief",
+                  "diagnostic": diagnostic, "recovered": True, "recovery": "Using a compact plan."})
+        self.assertEqual(run.issues[-1]["recovery"], "Using a compact plan.")
+
+
 class UITests(unittest.TestCase):
     def test_failed_verification_reaches_ui_and_persistent_log_with_provider_and_stage(self):
         backend = ScriptedBackend(ResearchPlan(objective="Find revenue", tasks=[TASK]),
@@ -35,6 +52,9 @@ class UITests(unittest.TestCase):
             self.assertEqual((result["failure"]["provider"], result["failure"]["stage"]), ("kimi", "verify"))
             self.assertEqual(result["failure"]["category"], "output_limit")
             self.assertEqual(result["sources"], 1)
+            self.assertIn("verify", result["stop_explanation"])
+            self.assertIn("output_limit", [issue["diagnostic"]["category"] for issue in result["issues"]])
+            self.assertTrue(result["warnings"])
             text = (Path(directory) / f'{result["run_id"]}.jsonl').read_text()
             self.assertNotIn("PRIVATE-ERROR", text)
             self.assertNotIn("Revenue was", text)

@@ -38,7 +38,8 @@ def _normalize(entries: list[dict]) -> SearchResult:
         documents.append({
             "url": url, "title": source.title, "published_at": source.published_at,
             "snippet": str(entry.get("content") or "")[:MAX_CONTENT_CHARS],
-            "content": content[:MAX_CONTENT_CHARS], "truncated": len(content) > MAX_CONTENT_CHARS,
+            "content": content, "truncated": False,
+            "metadata": {key: entry[key] for key in ("score", "published_date") if key in entry},
         })
     return SearchResult(text=json.dumps(documents, ensure_ascii=False), sources=list(sources.values()), documents=documents)
 

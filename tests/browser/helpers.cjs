@@ -61,7 +61,7 @@ const test = base.extend({
         failed.push({ url: req.url(), runId, error: req.failure()?.errorText });
       });
     });
-    const expected = { disconnect: false };
+    const expected = { disconnect: false, documentErrors: new Set() };
     await use(expected);
     await request.post('/__qa__/release');
     await info.attach('browser-diagnostics', { body: JSON.stringify({ errors, consoleErrors, failed, cancelled, csp }), contentType: 'application/json' });
@@ -78,6 +78,7 @@ const test = base.extend({
     expect(consoleErrors.filter(r => {
       const index = nativeWarnings.findIndex(v => v.url === r.url);
       if (r.text === nativeCspMessage && index >= 0) { nativeWarnings.splice(index, 1); return false; }
+      if (expected.documentErrors.has(r.url) && /409|503/.test(r.text)) return false;
       return !(
       expectedBusy.has(r.url) && /409/.test(r.text)
       ) && !(expected.disconnect && isResearch(r.url) && /ERR_CONNECTION_RESET|network.*(lost|reset)|Web Inspector/i.test(r.text));
@@ -87,7 +88,6 @@ const test = base.extend({
 
 async function open(page) {
   await page.goto('/');
-  await expect(page.locator('#submit')).toBeEnabled();
   await expect(page.locator('#submit')).toBeEnabled();
 }
 async function submit(page, question) {
