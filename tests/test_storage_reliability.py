@@ -171,3 +171,108 @@ class StorageReliabilityTests(unittest.TestCase):
             )
             self.assertEqual(store.merge(extraction, {"R1"}, [result], ["Q1"]), 0)
         self.assertEqual(state.findings, [])
+
+
+class AsyncStorageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state = ResearchState(question="Original question", plan=plan())
+        self.store = EvidenceStore(self.state, self.temp.name)
+
+    async def start_blocked_write(self):
+        import asyncio
+        import threading
+
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        original = self.store._persist_snapshot
+        snapshots = []
+
+        def write(snapshot):
+            snapshots.append(snapshot)
+            if len(snapshots) == 1:
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise TimeoutError("Persistence test did not release its writer")
+            original(snapshot)
+
+        self.addCleanup(release.set)
+        patcher = patch.object(self.store, "_persist_snapshot", side_effect=write)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        task = asyncio.create_task(self.store.apersist())
+        await asyncio.wait_for(entered.wait(), 2)
+        return task, release, snapshots
+
+    async def test_disk_write_yields_loop_and_uses_frozen_evidence(self):
+        task, release, snapshots = await self.start_blocked_write()
+        # Reaching this coroutine while the writer waits proves the loop yields.
+        self.state.question = "Changed while saving"
+        self.state.plan.research_requirements[0].question = "Changed requirement"
+        release.set()
+        await task
+        saved = json.loads((self.store.directory / "state.json").read_text())
+        self.assertEqual(saved["question"], "Original question")
+        self.assertEqual(
+            saved["plan"]["research_requirements"][0]["question"], "Establish fact 1"
+        )
+        self.assertIsNot(snapshots[0], self.state)
+        await self.store.apersist()
+        self.assertIn("Changed while saving", Path(self.state.facts_path).read_text())
+
+    async def test_concurrent_callers_share_latest_durable_snapshot(self):
+        import asyncio
+
+        first, release, snapshots = await self.start_blocked_write()
+        tasks = []
+        for index in range(10):
+            self.state.warnings.append(f"Mutation {index}")
+            tasks.append(asyncio.create_task(self.store.apersist()))
+        await asyncio.sleep(0)
+        self.assertTrue(all(not task.done() for task in tasks))
+        release.set()
+        await asyncio.gather(first, *tasks)
+        self.assertEqual(len(snapshots), 2)
+        saved = json.loads((self.store.directory / "state.json").read_text())
+        self.assertEqual(saved["warnings"], self.state.warnings)
+        self.assertEqual(list(self.store.directory.glob(".snapshot-*")), [])
+
+    async def test_repeated_cancellation_drains_old_write_before_terminal_save(self):
+        import asyncio
+
+        first, release, _ = await self.start_blocked_write()
+        first.cancel()
+        await asyncio.sleep(0)
+        self.state.status = "CANCELLED"
+        self.state.stop_reason = "cancelled"
+        terminal = asyncio.create_task(self.store.apersist())
+        first.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(first.done())
+        self.assertFalse(terminal.done())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        await terminal
+        saved = json.loads((self.store.directory / "state.json").read_text())
+        self.assertEqual(saved["status"], "CANCELLED")
+        self.assertEqual(saved["stop_reason"], "cancelled")
+        self.assertIn("CANCELLED", Path(self.state.facts_path).read_text())
+
+    async def test_failed_async_save_propagates_and_can_be_retried(self):
+        target = self.store.directory / "state.json"
+        previous = target.read_text()
+        self.state.question = "Retry after disk error"
+        with patch(
+            "deepsearchagent.evidence_store.os.fsync",
+            side_effect=OSError(errno.ENOSPC, "disk full"),
+        ):
+            with self.assertRaises(OSError):
+                await self.store.apersist()
+        self.assertEqual(target.read_text(), previous)
+        self.assertEqual(list(self.store.directory.glob(".snapshot-*")), [])
+        await self.store.apersist()
+        self.assertEqual(
+            json.loads(target.read_text())["question"], self.state.question
+        )

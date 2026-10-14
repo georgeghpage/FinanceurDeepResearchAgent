@@ -91,7 +91,12 @@ class RetryPolicy:
                     "upstream_span_id": f"tool-{meta['search_id']}" if meta.get("search_id") is not None else None})
                 trace({"kind": "search_error", **meta, "diagnostic": diagnostic.model_dump(),
                        "duration_seconds": round(time.monotonic() - attempt_started, 3)})
-                retryable = diagnostic.category in TRANSIENT
+                # Tavily sometimes reports an unclassified MCP tool failure.
+                # Re-run it under the same three-retry cap as transport failures.
+                # Recognized credential, quota and request errors stay terminal.
+                retryable = diagnostic.category in TRANSIENT or (
+                    provider == "tavily" and diagnostic.category == "tool_error"
+                )
                 retry = retryable and attempt < self.config.search_retries
                 if retry:
                     if budget:

@@ -507,7 +507,7 @@ Implementation references: [LangGraph Graph API](https://docs.langchain.com/oss/
 
 All Tavily entry points share `tools/retry.py`; the search router owns retries for
 research runs, while standalone Tavily calls use the same policy. There is no
-nested retry loop. Requests default to four total attempts with 1s exponential
+nested retry loop. Requests default to three retries (four total attempts) with 1s exponential
 backoff, a multiplier of 2, up to 20% jitter, and a 15s backoff cap. `Retry-After`
 can exceed the cap: it is honored if it fits the remaining deadline, otherwise
 that request stops. A shared cooldown prevents concurrent requests from ignoring
@@ -527,7 +527,7 @@ Credentials, invalid parameters, unsupported operations, account restrictions,
 and identified credit/plan exhaustion stop that request immediately. Tavily's
 432/433 usage limits are treated as exhausted quota, separately from temporary
 429 rate limits ([provider error reference](https://help.tavily.com/articles/8645538886-understanding-http-errors)).
-Unrecognized tool errors are conservatively not retried.
+Unrecognized Tavily MCP tool errors also retry up to three times.
 
 Exhausted searches return a structured failure, never a successful empty result.
 Independent queries continue. Previously collected sources and findings stay in

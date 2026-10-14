@@ -66,7 +66,9 @@ class SearchRouter:
         from .retry import cancellable_wait
         method = getattr(provider, "asearch_once", None) or getattr(provider, "asearch", None)
         if method:
-            return await cancellable_wait(method(query, timeout=timeout), self.cancellation)
+            # The retry policy cancels this whole attempt. Await directly so
+            # no extra task scheduling separates pacing from transport entry.
+            return await method(query, timeout=timeout)
         # A daemon adapter cannot hold asyncio's executor open after a deadline.
         future = concurrent.futures.Future()
         def work():
@@ -153,7 +155,6 @@ class SearchRouter:
                         await cancellable_wait(rate_wait(delay), self.cancellation)
                     if self.cancellation:
                         self.cancellation.check()
-                    self._next_request = time.monotonic() + 1 / self.retry_policy.config.search_requests_per_second
                 remaining = min(timeout, self.retry_policy.config.max_seconds - (time.monotonic() - self.session_started))
                 if self.budget:
                     remaining = min(remaining, self.budget.remaining_time())
@@ -163,7 +164,10 @@ class SearchRouter:
                 self.trace({"kind": "search_concurrency", "active": self._active,
                             "limit": self.retry_policy.config.search_concurrency})
                 try:
-                    return await asyncio.wait_for(attempt(remaining, meta), remaining)
+                    # timeout() preserves the current task; wait_for() would
+                    # enqueue transport behind other ready admissions.
+                    async with asyncio.timeout(remaining):
+                        return await attempt(remaining, meta)
                 finally:
                     self._active -= 1
 
@@ -179,6 +183,13 @@ class SearchRouter:
             self.trace({"kind": "search_start", **meta, "query": task.query, "source": task.source})
             token = SEARCH_CONTEXT.set(meta)
             try:
+                # Trace callbacks may perform slow synchronous storage. Start
+                # the interval after those callbacks, at transport entry.
+                if self.cancellation:
+                    self.cancellation.check()
+                if self.budget:
+                    self.budget.remaining_time()
+                self._next_request = time.monotonic() + 1 / self.retry_policy.config.search_requests_per_second
                 result = await self._once(provider, task.query, remaining)
                 if result.failure:
                     raise SearchError(result.failure.message, diagnostic=result.failure)

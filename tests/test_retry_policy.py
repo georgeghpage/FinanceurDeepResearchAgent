@@ -2,6 +2,7 @@
 
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 import httpx
 from deepsearchagent.budget import RunBudget
@@ -10,9 +11,72 @@ from deepsearchagent.diagnostics import failure_from_exception
 from deepsearchagent.models import PlannedQuery, SearchResult
 from deepsearchagent.retrieval import retrieve
 from deepsearchagent.tools.search import SearchError, SearchRouter
+from deepsearchagent.tools.fetch import parse_tavily_result
+from deepsearchagent.tools.tavily import TavilyMCPSearch
 
 
 class RetryPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tavily_tool_failures_retry_three_times_in_all_entry_points(self):
+        for standalone in (True, False):
+            for recover in (True, False):
+                with self.subTest(standalone=standalone, recover=recover):
+                    config = Config(search_backoff=0, search_requests_per_second=10000)
+                    provider = TavilyMCPSearch("https://fixture.invalid/mcp", "test-key", config=config)
+                    calls, events = [], []
+
+                    async def search(query, timeout):
+                        calls.append(query)
+                        if recover and len(calls) == 4:
+                            return SearchResult(text="recovered", sources=[])
+                        return parse_tavily_result(SimpleNamespace(
+                            isError=True, structuredContent={"error": "CANARY unknown failure"}, content=[]
+                        ))
+
+                    provider._search = AsyncMock(side_effect=search)
+                    provider.trace = events.append
+                    if standalone:
+                        if recover:
+                            result = await provider.asearch("same query", timeout=5)
+                            self.assertEqual(result.text, "recovered")
+                        else:
+                            with self.assertRaises(SearchError) as raised:
+                                await provider.asearch("same query", timeout=5)
+                            self.assertEqual(raised.exception.diagnostic.category, "tool_error")
+                    else:
+                        budget = RunBudget(config)
+                        results = await retrieve(
+                            [PlannedQuery(id="Q1", query="same query", requirement_ids=["R1"])],
+                            SearchRouter(provider), budget, events.append,
+                        )
+                        self.assertEqual((budget.searches, budget.search_retries), (4, 3))
+                        self.assertEqual(results[0].text, "recovered" if recover else "")
+                        self.assertEqual(bool(results[0].failure), not recover)
+                    self.assertEqual(calls, ["same query"] * 4)
+                    self.assertEqual(sum(e["kind"] == "search_retry" for e in events), 3)
+                    self.assertNotIn("CANARY", str(events))
+
+    async def test_tavily_permanent_tool_errors_do_not_retry(self):
+        for message, category in (
+            ("invalid api key", "authentication"),
+            ("credit limit exceeded", "quota_exhausted"),
+            ("account suspended", "account_restricted"),
+            ("invalid parameter", "invalid_request"),
+        ):
+            with self.subTest(category=category):
+                provider = TavilyMCPSearch("https://fixture.invalid/mcp", "test-key",
+                                          config=Config(search_backoff=0))
+
+                async def search(query, timeout):
+                    return parse_tavily_result(SimpleNamespace(
+                        isError=True, structuredContent={"error": message}, content=[]
+                    ))
+
+                provider._search = AsyncMock(side_effect=search)
+                with self.assertRaises(SearchError) as raised:
+                    await provider.asearch("query", timeout=5)
+                self.assertEqual(raised.exception.diagnostic.category, category)
+                self.assertEqual(provider._search.await_count, 1)
+
     def test_http_date_retry_after_is_bounded_and_only_used_for_retryable_status(self):
         class FixedDateTime(datetime):
             @classmethod

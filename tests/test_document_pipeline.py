@@ -176,6 +176,84 @@ class SearchContracts(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(starts[2] - starts[0], 0.09)
 
+    async def test_slow_trace_cannot_compress_transport_start_intervals(self):
+        import time
+
+        starts = []
+
+        class Provider:
+            async def asearch(self, query, *, timeout):
+                starts.append(time.monotonic())
+                return SearchResult(text="", sources=[])
+
+        router = SearchRouter(Provider())
+        router.configure(Config(search_requests_per_second=20))
+        stalled = False
+
+        def trace(event):
+            nonlocal stalled
+            if event["kind"] == "search_start" and not stalled:
+                stalled = True
+                time.sleep(0.07)
+
+        router.trace = trace
+        await asyncio.gather(
+            *(
+                router.asearch(ResearchTask(question="q", query=str(i)), timeout=1)
+                for i in range(3)
+            )
+        )
+        self.assertEqual(len(starts), 3)
+        for previous, current in zip(starts, starts[1:]):
+            self.assertGreaterEqual(current - previous, 0.045)
+
+    async def test_cancellation_in_start_trace_prevents_transport_entry(self):
+        from deepsearchagent.cancellation import Cancellation, ResearchCancelled
+
+        provider = FakeAsyncSearch(delay=0)
+        router = SearchRouter(provider)
+        router.configure(Config(search_requests_per_second=10000))
+        router.cancellation = Cancellation()
+
+        def trace(event):
+            if event["kind"] == "search_start":
+                router.cancellation.cancel()
+
+        router.trace = trace
+        with self.assertRaises(ResearchCancelled):
+            await router.asearch(ResearchTask(question="q", query="cancel"), timeout=1)
+        self.assertEqual(provider.queries, [])
+        self.assertEqual(router._inflight, {})
+
+    async def test_retrieval_waits_for_async_result_acceptance(self):
+        from deepsearchagent.retrieval import retrieve
+
+        config = Config(search_requests_per_second=10000)
+        budget = RunBudget(config)
+        router = SearchRouter(FakeAsyncSearch(delay=0))
+        entered, release = asyncio.Event(), asyncio.Event()
+        accepted = []
+
+        async def accept(query, result):
+            entered.set()
+            await release.wait()
+            accepted.append(query.id)
+
+        task = asyncio.create_task(
+            retrieve(
+                plan().search_queries[:1], router, budget, lambda event: None, accept
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertFalse(task.done())
+            self.assertEqual(accepted, [])
+        finally:
+            release.set()
+        results = await task
+        self.assertEqual(accepted, ["Q1"])
+        self.assertTrue(results[0].sources)
+
 
 class PipelineContracts(unittest.TestCase):
     def test_writer_comparison_freezes_identical_evidence_and_keeps_quality_unmeasured(

@@ -133,7 +133,7 @@ class ResearchAgent:
                         "diagnostic": diagnostic.model_dump(), "recovered": True, "recovery": recovery})
         # Persist a usable plan before making another provider request.
         state.plan = planner.assemble_plan(brief, [], min(15, self.config.max_searches))
-        store.persist()
+        await store.apersist()
         self.trace({"kind": "plan", **state.plan.model_dump(), "query_count": 0})
         backend = self._backend(min(self.config.planner_output_tokens, 4096), self.config.planner_input_tokens,
                                 thinking_enabled=False, max_continuations=0,
@@ -155,7 +155,7 @@ class ResearchAgent:
                         "diagnostic": diagnostic.model_dump(), "recovered": True, "recovery": recovery})
         state.plan = planner.assemble_plan(brief, queries, min(15, self.config.max_searches))
         self.trace({"kind": "plan", **state.plan.model_dump(), "query_count": len(state.plan.search_queries)})
-        store.persist()
+        await store.apersist()
 
     def _usage(self, state):
         state.api_calls, state.search_calls = self.budget.calls, self.budget.searches
@@ -181,7 +181,7 @@ class ResearchAgent:
         terminal_errors = []
         ready = {qid: asyncio.Event() for group in groups for qid in group}
 
-        def accept_result(query, result):
+        async def accept_result(query, result):
             # The event-loop owner persists evidence before releasing dependants.
             if isinstance(result, BaseException):
                 terminal_errors.append(result)
@@ -194,7 +194,7 @@ class ResearchAgent:
                 store.add_result(query, result)
                 usable[query.id] = result
             self._usage(state)
-            store.persist()
+            await store.apersist()
             if query.id in ready:
                 ready[query.id].set()
 
@@ -227,7 +227,7 @@ class ResearchAgent:
                 raise
             return output, ids, result_list, [q.id for q in assigned]
 
-        # All workers return immutable evidence; only this coroutine writes the store.
+        # Only the event-loop owner consolidates evidence; disk workers get frozen snapshots.
         async def guarded_extract(group):
             try:
                 return await extract(group)
@@ -257,15 +257,15 @@ class ResearchAgent:
                     # A worker's limit must not prevent its siblings or the classifier from finishing.
                     checkpoint = getattr(output, "extraction_checkpoint", None)
                     if checkpoint is not None:
-                        store.merge(*checkpoint)
+                        store.merge(*checkpoint, persist=False)
                         self._usage(state)
-                        store.persist()
+                        await store.apersist()
                     continue
                 if output is not None:
                     previous_count = len(state.findings)
-                    store.merge(*output)
+                    store.merge(*output, persist=False)
                     self._usage(state)
-                    store.persist()
+                    await store.apersist()
                     self.trace({"kind": "findings", "stage": "extract", "findings": [f.model_dump() for f in state.findings[previous_count:]]})
         finally:
             for worker in workers:
@@ -279,7 +279,7 @@ class ResearchAgent:
                                     "queries": [q.query for q in queries], "new_findings": gain,
                                     "source_count": len(state.sources), "evidence_version": state.evidence_version})
         self._usage(state)
-        store.persist()
+        await store.apersist()
         return gain
 
     def _get_judge(self, fallback=False):
@@ -358,7 +358,7 @@ class ResearchAgent:
                             "critical_gaps": ["Deterministic evidence checks rejected completeness."],
                             "suggested_queries": [], "reason": "Proposed READY lacked eligible requirement-level evidence."})
                     state.judge = result
-                    record = store.save_evaluation(payload, result, judge.provider, judge.model, advisory)
+                    record = await store.asave_evaluation(payload, result, judge.provider, judge.model, advisory)
                     self.trace({"kind": "verification", "stage": "verify", **record,
                                 "sufficient": result.decision == "READY", "gaps": result.critical_gaps,
                                 "coverage_score": result.coverage_score, "evidence_score": result.evidence_score,
@@ -560,7 +560,7 @@ class ResearchAgent:
                                               answer_claim_ids=cited, hard_issues=hard_issues)
                     state.quality_evaluation = result
                     state.quality_status = result.decision.lower()
-                    store.save_quality_evaluation(payload, result, judge.provider, judge.model, advisory)
+                    await store.asave_quality_evaluation(payload, result, judge.provider, judge.model, advisory)
                     self.trace({"kind": "quality_evaluation", **metadata, "decision": result.decision,
                                 "scores": result.scores.model_dump(), "overall_score": result.overall_score,
                                 "rejection_reasons": result.critical_issues, "confidence": result.confidence,
@@ -609,7 +609,7 @@ class ResearchAgent:
             return draft
         for iteration in range(self.config.quality_max_iterations + 1):
             result = await self._assess_answer(state, draft, store)
-            store.persist()
+            await store.apersist()
             if result is None or result.decision == "PASS":
                 return draft
             if result.decision == "INSUFFICIENT_EVIDENCE":
@@ -655,7 +655,7 @@ class ResearchAgent:
             raise ValueError("Research question must not be empty.")
         state = ResearchState(question=question.strip())
         self._latest = state
-        store = EvidenceStore(state, self.config.session_dir)
+        store = EvidenceStore(state, self.config.session_dir, persist=False)
         def checkpoint(schema, content, complete):
             atomic_write(store.directory / f"generation-{uuid4().hex}-{schema}.json",
                          json.dumps({"schema": schema, "content": content, "complete": complete,
@@ -664,6 +664,7 @@ class ResearchAgent:
         draft = None
         self.trace({"kind": "session_initialized", "session_id": state.session_id, "query": state.question, "facts_path": state.facts_path})
         try:
+            await store.apersist()
             self._stage("plan")
             state.status = "PLANNING"
             await self._plan(state, store)
@@ -673,7 +674,7 @@ class ResearchAgent:
                 gain = await self._round(state, store, queries, groups)
                 decision = await self._evaluate(state, store)
                 self._usage(state)
-                store.persist()
+                await store.apersist()
                 if decision is None:
                     state.stop_reason = "no_tasks"
                     break
@@ -740,7 +741,7 @@ class ResearchAgent:
                         and not state.unresolved and not state.contradictions)
             state.status = ("CANCELLED" if state.stop_reason == "cancelled" else "COMPLETE" if complete
                             else "PARTIAL" if state.findings else "FAILED")
-            store.persist()
+            await store.apersist()
             if self.writer_backend is not None:
                 try:
                     self.writer_backend.close_stream()
@@ -755,7 +756,7 @@ class ResearchAgent:
                         exc, provider=judge.provider, stage="cleanup", operation="judge_close").model_dump()})
         report = writer.render(state, draft)
         self._stage("finalize", "agent")
-        atomic_write(store.directory / "report.md", report)
+        await store.awrite("report.md", report)
         self.trace({"kind": "run_complete" if state.status == "COMPLETE" else "run_stopped",
                     "session_id": state.session_id, "stage": self.stage, "provider": "agent",
                     "stop_reason": state.stop_reason, "status": state.status, "failure": state.failure.model_dump() if state.failure else None,

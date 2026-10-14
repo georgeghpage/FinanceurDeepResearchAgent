@@ -87,6 +87,16 @@ Financial accuracy:
   needed for an inference; do not present a forecast as an established fact.
 
 Coverage and workflow:
+- During planning, prioritize the evidence needed to reach a general conclusion
+  that directly answers the user's initial question. Plan for a report that opens
+  with a concise summary beginning with the exact text "tldr:" and ends its
+  analytical content with a Conclusion section. These are report requirements,
+  not separate research tasks; return the current stage's JSON contract.
+- During report writing, begin the first report paragraph with the exact text
+  "tldr:" and summarize the answer. End the analytical content with a general
+  conclusion that directly answers the initial question, synthesizes the evidence,
+  and states any material uncertainty. Ground both in cited findings; when evidence
+  is insufficient, explain what can and cannot be concluded.
 - Identify missing evidence and conflicting claims. Explain material conflicts
   rather than resolving them by guessing. Request targeted follow-up tasks when
   the stage supports them, within its task limit.

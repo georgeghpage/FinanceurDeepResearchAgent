@@ -1,3 +1,13 @@
+# Latest performance review — 2026-10-14
+
+The user requested an unfinished-handoff check and architecture/performance optimization. The latest historical implementation entries were complete; remaining external validation and release coverage were identified. Implemented awaited frozen evidence snapshots with ordered/coalesced disk writes and cancellation draining, removed duplicate merge persistence, reused normalized excerpts, and tightened search pacing at actual transport entry. See [PERFORMANCE_REVIEW.md](../PERFORMANCE_REVIEW.md) for implementation, measurements and prioritized follow-ups.
+
+Final validation: **275 backend tests, 272 passed, three disabled paid-provider skips, zero failures/errors**, with all nine PostgreSQL tests enabled; **32 Chromium checks passed**; **36 Node checks passed, one expected standalone-HTTP skip**; scoped QA and diff checks passed. A 20-session/five-concurrency fake-provider comparison measured p95 loop lag **18.111 → 7.772 ms**, with small total-runtime change and increased copying/allocation costs. Current branch gates remain unmet for budget **94.286%**, judge **94.444%**, and orchestrator **85.204%** against 95% targets; evidence store passes its 90% target at **90.909%**. Do not infer production readiness from this run.
+
+Changes are uncommitted. The disposable QA PostgreSQL cluster on port 55433 was stopped. No paid APIs, deployment, real credential inspection or delegated agents were used. UI PostgreSQL connection/batch work, large-document preprocessing, asynchronous preview writes, native async model transport, live/human validation and hosted CI remain follow-up opportunities; the review does not claim those are implemented.
+
+---
+
 # Latest continuation — 2026-10-13
 
 The user's request to continue has been carried through the research/report upgrade. Use [IMPLEMENTATION_PROGRESS.md](../IMPLEMENTATION_PROGRESS.md) for the current changes and verification, and [WRITER_EVALUATION.md](../WRITER_EVALUATION.md) for backend-only model configuration and the evidence-frozen comparison tool.

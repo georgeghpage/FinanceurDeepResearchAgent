@@ -1,6 +1,7 @@
 """Independent bounded search fan-out; tool failures are explicit evidence gaps."""
 
 import asyncio
+import inspect
 
 from .cancellation import ResearchCancelled
 from .diagnostics import failure_from_exception
@@ -34,7 +35,9 @@ async def retrieve(queries, router, budget, trace, on_result=None):
         except Exception as exc:
             result = exc
         if on_result:
-            on_result(query, result)
+            accepted = on_result(query, result)
+            if inspect.isawaitable(accepted):
+                await accepted
         return result
 
     tasks = [asyncio.create_task(completed(q)) for q in queries]
